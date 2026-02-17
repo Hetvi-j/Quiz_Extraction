@@ -5,6 +5,9 @@ import FormData from "form-data";
 // Free OCR Service URL (Python service running on port 8001)
 const FREE_OCR_SERVICE_URL = process.env.FREE_OCR_SERVICE_URL || "http://localhost:8001";
 
+// Landing AI API key (for fallback when Groq returns too few questions)
+const VA_API_KEY = process.env.LANDING_AI_API_KEY || "";
+
 /**
  * Health check for Free OCR Service
  */
@@ -66,11 +69,64 @@ export const extractFromFile = async (req, res) => {
       }
     );
 
-    // Clean up uploaded file
-    fs.unlinkSync(filePath);
-
-    const extraction = response.data.extraction || {};
+    let extraction = response.data.extraction || {};
     console.log(`✅ Extracted ${extraction.questions?.length || 0} questions`);
+
+    // Fallback to Landing AI if Groq returned suspiciously few questions
+    const pageCountEstimate = req.body?.pageCount ? Number(req.body.pageCount) : null;
+    const expectedMin = pageCountEstimate ? Math.max(5, pageCountEstimate * 2) : 10;
+
+    if ((extraction.questions?.length || 0) < expectedMin && VA_API_KEY) {
+      console.log("⚠️ Groq returned few questions — attempting Landing AI fallback...");
+      try {
+        // Call Landing AI parse + extract endpoints with the same file
+        const formParse = new FormData();
+        formParse.append("document", fs.createReadStream(filePath));
+
+        const parseResponse = await axios.post(
+          "https://api.va.landing.ai/v1/ade/parse",
+          formParse,
+          {
+            headers: {
+              ...formParse.getHeaders(),
+              Authorization: `Bearer ${VA_API_KEY}`
+            }
+          }
+        );
+
+        const { markdown } = parseResponse.data;
+        if (markdown) {
+          const formExtract = new FormData();
+          formExtract.append("markdown", markdown);
+          formExtract.append("schema", JSON.stringify({ type: "object", properties: { questions: { type: "array" } } }));
+
+          const extractResponse = await axios.post(
+            "https://api.va.landing.ai/v1/ade/extract",
+            formExtract,
+            {
+              headers: {
+                ...formExtract.getHeaders(),
+                Authorization: `Bearer ${VA_API_KEY}`
+              }
+            }
+          );
+
+          const landingExtraction = extractResponse.data.extraction || {};
+          if (landingExtraction.questions && landingExtraction.questions.length > (extraction.questions?.length || 0)) {
+            console.log(`✅ Landing AI returned ${landingExtraction.questions.length} questions — using Landing AI result`);
+            extraction = landingExtraction;
+          } else {
+            console.log('ℹ️ Landing AI did not improve question count');
+          }
+        }
+      } catch (e) {
+        console.warn('Landing AI fallback failed:', e.message);
+      }
+    }
+
+    // Clean up uploaded file
+    try { fs.unlinkSync(filePath); } catch (e) {}
+
     console.log(`==========================================\n`);
 
     res.status(200).json({

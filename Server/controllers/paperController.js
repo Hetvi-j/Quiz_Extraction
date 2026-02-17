@@ -447,21 +447,18 @@ export const uploadKey = async (req, res) => {
     // Calculate total marks
     let totalMarks = questions.reduce((sum, q) => sum + q.marks, 0);
 
-    // If no questions extracted but we have totalMarks from documentInfo, create placeholder questions
-    if (questions.length === 0 && extraction.documentInfo?.totalMarks) {
-      const numQuestions = Number(extraction.documentInfo.totalMarks) || 6;
-      console.log(`⚠️ No questions extracted, creating ${numQuestions} placeholder questions from totalMarks`);
+    // If totalMarks from document differs from calculated, use document's value as fallback
+    if (extraction.documentInfo?.totalMarks && !totalMarks) {
+      totalMarks = extraction.documentInfo.totalMarks;
+      console.log(`ℹ️ Using totalMarks from document: ${totalMarks}`);
+    }
 
-      for (let i = 1; i <= numQuestions; i++) {
-        questions.push({
-          questionText: `Question ${i}`,
-          questionType: "MCQ",
-          marks: 1,
-          options: [],
-          answer: ""
-        });
-      }
-      totalMarks = numQuestions;
+    // ⚠️ REMOVED PLACEHOLDER GENERATION: If extraction fails, return error instead
+    if (questions.length === 0) {
+      console.warn(`❌ CRITICAL: Landing AI returned 0 questions from: ${fileName}`);
+      console.warn(`Extraction dump:`, JSON.stringify(extraction, null, 2));
+      // Do NOT create placeholders — return error so you can debug the actual issue
+      throw new Error(`Landing AI failed to extract any questions from ${fileName}. Check file format and try uploading the file via Groq instead.`);
     }
 
     console.log(`✅ Total: ${questions.length} questions, ${totalMarks} marks`);

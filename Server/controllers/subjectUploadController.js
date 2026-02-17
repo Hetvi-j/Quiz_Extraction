@@ -8,6 +8,71 @@ import Upload from "../models/Upload.js";
 import SubjectQuiz from "../models/SubjectQuiz.js";
 import { addToQuestionBank } from "./questionBankController.js";
 
+// --- Tolerant comparison helpers ---
+const normalizeText = (s = "") => {
+  if (s === null || s === undefined) return "";
+  let t = String(s).normalize("NFKD").toLowerCase().trim();
+  // small number words
+  const numWords = {
+    zero: '0', one: '1', two: '2', three: '3', four: '4', five: '5',
+    six: '6', seven: '7', eight: '8', nine: '9', ten: '10'
+  };
+  t = t.replace(/\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten)\b/g, m => numWords[m] || m);
+  // remove punctuation except dot and minus
+  t = t.replace(/[^\w\s\.-]/g, ' ');
+  t = t.replace(/\s+/g, ' ').trim();
+  return t;
+};
+
+const isNumber = (s) => {
+  if (s === null || s === undefined) return false;
+  return !isNaN(Number(String(s).trim()));
+};
+
+const numericSimilar = (a, b, relTol = 0.01) => {
+  try {
+    const na = Number(a);
+    const nb = Number(b);
+    if (!isFinite(na) || !isFinite(nb)) return false;
+    return Math.abs(na - nb) <= Math.max(relTol * Math.max(Math.abs(na), Math.abs(nb)), relTol);
+  } catch (e) {
+    return false;
+  }
+};
+
+// simple Levenshtein distance
+const levenshtein = (a, b) => {
+  a = a || '';
+  b = b || '';
+  const al = a.length, bl = b.length;
+  if (al === 0) return bl;
+  if (bl === 0) return al;
+  const dp = Array.from({ length: al + 1 }, () => new Array(bl + 1).fill(0));
+  for (let i = 0; i <= al; i++) dp[i][0] = i;
+  for (let j = 0; j <= bl; j++) dp[0][j] = j;
+  for (let i = 1; i <= al; i++) {
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[al][bl];
+};
+
+const similarity = (a, b) => {
+  if (!a && !b) return 1.0;
+  a = String(a || ''); b = String(b || '');
+  if (a === b) return 1.0;
+  const dist = levenshtein(a, b);
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1.0;
+  return Math.max(0, 1 - dist / maxLen);
+};
+
+// thresholds: >=0.85 full, >=0.7 partial
+const FULL_SIM = 0.85;
+const PARTIAL_SIM = 0.7;
+
 // Helper function to mask enrollment number (hide last 5 digits)
 const maskEnrollment = (enrollment) => {
   if (!enrollment) return enrollment;
@@ -200,6 +265,7 @@ const processFileWithLandingAI = async (filePath, fileName) => {
   if (!markdown) {
     throw new Error("No markdown returned from parse API");
   }
+  console.log(`LandingAI parse returned markdown length: ${String(markdown).length}`);
 
   // STEP 2: Extract structured data
   const formExtract = new FormData();
@@ -216,6 +282,15 @@ const processFileWithLandingAI = async (filePath, fileName) => {
       }
     }
   );
+
+  // Debug: log extraction summary
+  try {
+    const extractionPreview = extractResponse.data.extraction || {};
+    const qcount = Array.isArray(extractionPreview.questions) ? extractionPreview.questions.length : 0;
+    console.log(`LandingAI extract: found ${qcount} question(s) in ${fileName}`);
+  } catch (e) {
+    console.warn('Could not parse LandingAI extract response summary:', e.message);
+  }
 
   return extractResponse.data.extraction || {};
 };
@@ -489,17 +564,54 @@ const evaluateStudentAnswers = (studentAnswers, answerKey) => {
       };
     }
 
-    const studentAns = (sa.studentAnswer || sa.Answer || '').toString().toLowerCase().trim();
-    const correctAns = (keyQuestion.correctAnswer || '').toString().toLowerCase().trim();
+    const studentAnsRaw = sa.studentAnswer || sa.Answer || '';
+    const correctAnsRaw = keyQuestion.correctAnswer || '';
+    const studentAns = normalizeText(studentAnsRaw);
+    const correctAns = normalizeText(correctAnsRaw);
 
-    // Check if correct (handle multiple correct answers separated by comma)
-    const correctOptions = correctAns.split(',').map(a => a.trim());
-    const isCorrect = correctOptions.some(opt => opt === studentAns);
+    // Handle multi-correct options
+    const correctOptions = correctAns.split(',').map(a => a.trim()).filter(Boolean);
 
     const marks = keyQuestion.marks || 1;
     totalMarks += marks;
 
-    const marksObtained = isCorrect ? marks : 0;
+    let isCorrect = false;
+    let marksObtained = 0;
+
+    // If both numeric, compare numerically
+    if (isNumber(correctAns) && isNumber(studentAns)) {
+      if (numericSimilar(correctAns, studentAns)) {
+        isCorrect = true;
+        marksObtained = marks;
+      } else {
+        // partial proportional score for numeric closeness
+        const a = Number(correctAns);
+        const b = Number(studentAns);
+        const ratio = Math.max(0, 1 - Math.abs(a - b) / (Math.abs(a) + 1e-9));
+        marksObtained = Math.round(ratio * marks * 100) / 100;
+        isCorrect = marksObtained >= marks;
+      }
+    } else {
+      // Compare against each correct option using similarity
+      let bestSim = 0;
+      for (const opt of correctOptions.length ? correctOptions : [correctAns]) {
+        if (!opt) continue;
+        const sim = similarity(opt, studentAns);
+        if (sim > bestSim) bestSim = sim;
+      }
+
+      if (bestSim >= FULL_SIM) {
+        isCorrect = true;
+        marksObtained = marks;
+      } else if (bestSim >= PARTIAL_SIM) {
+        isCorrect = false;
+        marksObtained = Math.round(bestSim * marks * 100) / 100;
+      } else {
+        isCorrect = false;
+        marksObtained = 0;
+      }
+    }
+
     obtainedMarks += marksObtained;
 
     return {

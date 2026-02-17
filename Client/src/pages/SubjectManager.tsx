@@ -48,11 +48,14 @@ import {
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import AnalysisBarGraph from './AnalysisBarGraph';
 import AnalysisPieChart from './AnalysisPieChart';
+import QuestionDisplay, { QuestionTypeSummary } from '@/components/QuestionDisplay';
+import EvalResultDisplay from '@/components/EvalResultDisplay';
 
 // V1 API
 const API_BASE_URL = "http://localhost:8080/api/v1/papers";
 const QUESTION_BANK_URL = "http://localhost:8080/api/v1/question-bank";
 const FREE_OCR_URL = "http://localhost:8080/api/v1/free-ocr";
+const LLM_EVALUATOR_URL = "http://localhost:8002";
 
 interface Subject {
   _id: string;
@@ -227,8 +230,13 @@ const SubjectManager = () => {
   const [questionBank, setQuestionBank] = useState<QuestionBank | null>(null);
   const [isLoadingQuestionBank, setIsLoadingQuestionBank] = useState(false);
   const [questionBankSearch, setQuestionBankSearch] = useState('');
-  const [questionBankFilter, setQuestionBankFilter] = useState<'all' | 'MCQ' | 'SHORT' | 'LONG' | 'TRUE_FALSE'>('all');
+  const [questionBankFilter, setQuestionBankFilter] = useState<'all' | 'MCQ' | 'SHORT' | 'LONG' | 'TRUE_FALSE' | 'FILL_BLANK'>('all');
   const [questionBankDifficultyFilter, setQuestionBankDifficultyFilter] = useState<'all' | 'Easy' | 'Medium' | 'Hard'>('all');
+
+  // LLM evaluation state
+  const [llmEvalResults, setLlmEvalResults] = useState<Record<string, any>>({});
+  const [isLlmEvaluating, setIsLlmEvaluating] = useState(false);
+  const [evalMode, setEvalMode] = useState<'standard' | 'llm'>('llm');
 
   const keyFileRef = useRef<HTMLInputElement>(null);
   const studentFileRef = useRef<HTMLInputElement>(null);
@@ -287,7 +295,8 @@ const SubjectManager = () => {
   const fetchQuizDetails = async (subjectId: string, quizId: string) => {
     try {
       const response = await axios.get(`${API_BASE_URL}/papers/${quizId}`, getAuthHeaders());
-      setSelectedQuiz(prev => prev?._id === quizId ? response.data.paper : prev);
+      // Always replace selected quiz with fresh server copy
+      setSelectedQuiz(response.data.paper);
     } catch (error) {
       console.error("Error fetching quiz details:", error);
     }
@@ -617,6 +626,128 @@ const SubjectManager = () => {
       setUploadStatus({ type: 'error', text: error.response?.data?.message || 'Evaluation failed' });
     } finally {
       setIsEvaluating(false);
+    }
+  };
+
+  // LLM-enhanced evaluation for mixed objective + subjective papers
+  const handleLlmEvaluate = async () => {
+    if (!selectedSubject || !selectedQuiz) return;
+    if (!selectedQuiz.key?.questions || selectedQuiz.key.questions.length === 0) {
+      setUploadStatus({ type: 'error', text: 'No answer key uploaded. Upload an answer key first.' });
+      return;
+    }
+
+    const studentResponses = selectedQuiz.studentResponses || [];
+    if (studentResponses.length === 0) {
+      setUploadStatus({ type: 'error', text: 'No student responses uploaded.' });
+      return;
+    }
+
+    try {
+      setIsLlmEvaluating(true);
+      const keyQuestions = selectedQuiz.key.questions;
+
+      // Check if there are any subjective questions
+      const hasSubjective = keyQuestions.some((q: any) =>
+        ['SHORT', 'LONG'].includes((q.questionType || 'MCQ').toUpperCase())
+      );
+
+      setUploadStatus({
+        type: 'info',
+        text: hasSubjective
+          ? `Evaluating ${studentResponses.length} student(s) with LLM for subjective answers...`
+          : `Evaluating ${studentResponses.length} student(s)...`
+      });
+
+      const allResults: Record<string, any> = {};
+
+      for (let si = 0; si < studentResponses.length; si++) {
+        const student = studentResponses[si];
+        const enrollment = student.enrollmentNumber || `Student_${si + 1}`;
+        const studentAnswers = student.questions || [];
+
+        setUploadStatus({
+          type: 'info',
+          text: `Evaluating student ${si + 1}/${studentResponses.length} (${enrollment})...`
+        });
+
+        // Build question-answer pairs for the evaluator
+        const evalQuestions = keyQuestions.map((keyQ: any, idx: number) => {
+          const studentAns = studentAnswers[idx];
+          return {
+            questionText: keyQ.questionText || `Question ${idx + 1}`,
+            questionType: keyQ.questionType || 'MCQ',
+            marks: keyQ.marks || 1,
+            correctAnswer: keyQ.Answer || keyQ.answer || keyQ.correctAnswer || '',
+            studentAnswer: studentAns?.answer || '',
+          };
+        });
+
+        try {
+          // Call LLM evaluator for this student
+          const evalResponse = await axios.post(
+            `${LLM_EVALUATOR_URL}/evaluate/bulk`,
+            { questions: evalQuestions },
+            { timeout: 180000 }
+          );
+
+          if (evalResponse.data.success) {
+            allResults[enrollment] = {
+              results: evalResponse.data.results,
+              summary: evalResponse.data.summary,
+              enrollment,
+            };
+          }
+        } catch (err: any) {
+          console.error(`LLM eval failed for ${enrollment}:`, err);
+          allResults[enrollment] = {
+            results: [],
+            summary: null,
+            enrollment,
+            error: err.message,
+          };
+        }
+      }
+
+      setLlmEvalResults(prev => ({
+        ...prev,
+        [selectedQuiz._id]: allResults
+      }));
+
+      // Also save to the standard analytics pipeline
+      try {
+        const standardResponse = await axios.post(
+          `${API_BASE_URL}/papers/${selectedQuiz._id}/evaluate`,
+          {},
+          getAuthHeaders()
+        );
+
+        if (standardResponse.data.success) {
+          setQuizAnalyticsMap(prev => ({
+            ...prev,
+            [selectedQuiz._id]: {
+              results: standardResponse.data.results,
+              analytics: standardResponse.data.analytics,
+              paperName: standardResponse.data.paperName,
+              subjectName: standardResponse.data.subjectName
+            }
+          }));
+        }
+      } catch {
+        // Standard evaluation is secondary, LLM results are primary
+      }
+
+      const totalStudents = Object.keys(allResults).length;
+      const successStudents = Object.values(allResults).filter((r: any) => !r.error).length;
+      setUploadStatus({
+        type: 'success',
+        text: `LLM evaluation complete! ${successStudents}/${totalStudents} students evaluated successfully.`
+      });
+      setActiveTab('analytics');
+    } catch (error: any) {
+      setUploadStatus({ type: 'error', text: error.message || 'LLM evaluation failed' });
+    } finally {
+      setIsLlmEvaluating(false);
     }
   };
 
@@ -1095,9 +1226,12 @@ const SubjectManager = () => {
                             Answer Key
                           </h4>
                           {selectedQuiz.key?.uploadedAt ? (
-                            <div className="text-sm text-green-700">
-                              <CheckCircle className="h-4 w-4 inline mr-1" />
-                              Key uploaded ({selectedQuiz.key?.questions?.length || 0} questions, {selectedQuiz.totalMarks} marks)
+                            <div className="space-y-2">
+                              <div className="text-sm text-green-700">
+                                <CheckCircle className="h-4 w-4 inline mr-1" />
+                                Key uploaded ({selectedQuiz.key?.questions?.length || 0} questions, {selectedQuiz.totalMarks} marks)
+                              </div>
+                              <QuestionTypeSummary questions={selectedQuiz.key.questions || []} />
                             </div>
                           ) : (
                             <div className="space-y-3">
@@ -1171,20 +1305,51 @@ const SubjectManager = () => {
                           </div>
                         </div>
 
-                        {/* Evaluate Button */}
-                        {selectedQuiz.key?.questions?.length > 0 && (selectedQuiz.studentResponses?.length || 0) > 0 && (
-                          <Button
-                            onClick={handleEvaluate}
-                            disabled={isEvaluating}
-                            className="w-full bg-green-600 hover:bg-green-700"
-                          >
-                            {isEvaluating ? (
-                              <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                            ) : (
-                              <Play className="h-4 w-4 mr-2" />
+                        {/* Question Type Summary */}
+                        {selectedQuiz.key?.questions?.length > 0 && (
+                          <div className="p-4 border rounded-lg bg-gray-50 border-gray-200">
+                            <h4 className="font-semibold text-sm mb-2">Extracted Question Types</h4>
+                            <QuestionTypeSummary questions={selectedQuiz.key.questions} />
+                            {selectedQuiz.key.questions.some((q: any) => ['SHORT', 'LONG'].includes(q.questionType)) && (
+                              <p className="text-xs text-indigo-600 mt-2">
+                                This paper contains subjective questions -- use LLM Evaluate for AI-powered grading.
+                              </p>
                             )}
-                            Evaluate All Students
-                          </Button>
+                          </div>
+                        )}
+
+                        {/* Evaluate Buttons */}
+                        {selectedQuiz.key?.questions?.length > 0 && (selectedQuiz.studentResponses?.length || 0) > 0 && (
+                          <div className="space-y-2">
+                            {/* LLM Evaluate (for papers with subjective questions) */}
+                            <Button
+                              onClick={handleLlmEvaluate}
+                              disabled={isLlmEvaluating || isEvaluating}
+                              className="w-full bg-indigo-600 hover:bg-indigo-700"
+                            >
+                              {isLlmEvaluating ? (
+                                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                              ) : (
+                                <Sparkles className="h-4 w-4 mr-2" />
+                              )}
+                              {isLlmEvaluating ? 'AI Evaluating...' : 'LLM Evaluate (Objective + Subjective)'}
+                            </Button>
+
+                            {/* Standard Evaluate (exact match only) */}
+                            <Button
+                              onClick={handleEvaluate}
+                              disabled={isEvaluating || isLlmEvaluating}
+                              variant="outline"
+                              className="w-full"
+                            >
+                              {isEvaluating ? (
+                                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                              ) : (
+                                <Play className="h-4 w-4 mr-2" />
+                              )}
+                              Standard Evaluate (Exact Match Only)
+                            </Button>
+                          </div>
                         )}
                       </CardContent>
                     </Card>
@@ -1437,6 +1602,49 @@ const SubjectManager = () => {
 
               {/* Analytics Tab */}
               <TabsContent value="analytics">
+                {/* LLM Evaluation Results */}
+                {selectedQuiz && llmEvalResults[selectedQuiz._id] && (
+                  <div className="space-y-6 mb-8">
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="flex items-center gap-2">
+                          <Sparkles className="h-5 w-5 text-indigo-600" />
+                          LLM Evaluation Results (AI-Graded)
+                        </CardTitle>
+                        <CardDescription>
+                          Subjective answers evaluated by AI, objective answers graded by exact matching
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="space-y-6">
+                          {Object.entries(llmEvalResults[selectedQuiz._id] as Record<string, any>).map(([enrollment, data]: [string, any]) => (
+                            <div key={enrollment} className="border rounded-lg p-4">
+                              <h3 className="font-semibold text-lg mb-3 flex items-center gap-2">
+                                <GraduationCap className="h-5 w-5" />
+                                Student: {maskEnrollment(enrollment)}
+                                {data.error && (
+                                  <Badge className="bg-red-100 text-red-700">
+                                    <XCircle className="h-3 w-3 mr-1" />
+                                    Evaluation Error
+                                  </Badge>
+                                )}
+                              </h3>
+                              {data.error ? (
+                                <p className="text-sm text-red-600">Error: {data.error}</p>
+                              ) : (
+                                <EvalResultDisplay
+                                  results={data.results || []}
+                                  summary={data.summary}
+                                />
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  </div>
+                )}
+
                 {results.length > 0 ? (
                   <div className="space-y-6">
                     {/* Header Card with Stats */}
@@ -1759,15 +1967,23 @@ const SubjectManager = () => {
                     </Card>
                   </div>
                 ) : (
-                  <Card>
-                    <CardContent className="py-16 text-center">
-                      <BarChart3 className="h-16 w-16 mx-auto mb-4 text-gray-300" />
-                      <h2 className="text-xl font-semibold text-gray-500">No Results Yet</h2>
-                      <p className="text-gray-400 mt-2">
-                        Upload answer key and student responses, then evaluate
-                      </p>
-                    </CardContent>
-                  </Card>
+                  <>
+                    {/* Show LLM results even if standard results are empty */}
+                    {!(selectedQuiz && llmEvalResults[selectedQuiz._id]) && (
+                      <Card>
+                        <CardContent className="py-16 text-center">
+                          <BarChart3 className="h-16 w-16 mx-auto mb-4 text-gray-300" />
+                          <h2 className="text-xl font-semibold text-gray-500">No Results Yet</h2>
+                          <p className="text-gray-400 mt-2">
+                            Upload answer key and student responses, then evaluate
+                          </p>
+                          <p className="text-indigo-500 text-sm mt-1">
+                            Use "LLM Evaluate" for AI-powered grading of subjective answers
+                          </p>
+                        </CardContent>
+                      </Card>
+                    )}
+                  </>
                 )}
               </TabsContent>
             </Tabs>

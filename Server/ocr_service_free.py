@@ -23,6 +23,7 @@ import pypdfium2 as pdfium
 
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"  # Llama 4 Vision model
 
@@ -91,7 +92,9 @@ def extract_with_groq(images: list) -> dict:
     num_pages = len(images)
     prompt = f"""Look at these {num_pages} page(s) of a quiz/exam document. Extract ALL questions with COMPLETE text.
 
-IMPORTANT: Questions may span across pages. Combine information from all pages to get complete questions.
+IMPORTANT: This document may contain BOTH objective (MCQ, True/False, Fill in the Blank) AND subjective (Short Answer, Long Answer, Essay, Descriptive) questions. You MUST handle ALL types.
+
+Questions may span across pages. Combine information from all pages to get complete questions.
 
 Return a JSON object with this EXACT structure:
 {{
@@ -102,37 +105,62 @@ Return a JSON object with this EXACT structure:
   }},
   "questions": [
     {{
-      "questionText": "ONLY the question text and code (DO NOT include options here)",
-      "questionType": "MCQ or SHORT or LONG or TRUE_FALSE",
+      "questionText": "ONLY the question text and code (DO NOT include options here for MCQs)",
+      "questionType": "MCQ or SHORT or LONG or TRUE_FALSE or FILL_BLANK",
       "marks": marks for this question as number (default 1),
       "options": ["A) option1", "B) option2", "C) option3", "D) option4"],
-      "Answer": "letter(s) only - if multiple correct use comma like A,C"
+      "Answer": "see rules below for format based on questionType"
     }}
   ]
 }}
 
+QUESTION TYPE CLASSIFICATION RULES:
+- "MCQ": Question has multiple choice options (A, B, C, D). Answer = letter(s) only e.g. "B" or "A,C"
+- "TRUE_FALSE": Question asks True or False. Answer = "True" or "False"
+- "FILL_BLANK": Question has blanks to fill. Answer = the word/phrase that fills the blank
+- "SHORT": Subjective question expecting 1-3 sentence answer (typically 1-5 marks). Answer = the full written answer text
+- "LONG": Subjective question expecting paragraph/essay/detailed answer (typically 5+ marks, or says "explain", "describe", "discuss", "elaborate", "write in detail"). Answer = the full written answer text
+
 CRITICAL RULES:
 1. questionText = ONLY the question stem and any code. NEVER include options (A, B, C, D) in questionText
-2. options = array with ALL choices separately ["A) ...", "B) ...", "C) ...", "D) ..."]
-3. Answer = ONLY letter(s). Single answer: "B". Multiple correct: "A,C" or "B,D"
-4. If a question starts on one page and continues on next, COMBINE them
-5. For code questions, include the ENTIRE code snippet in questionText
-6. Read ALL text carefully from ALL pages
-7. Include question numbers like "Q1", "1.", etc. in questionText
-8. If answer is marked/circled/ticked, extract ONLY the letter(s)
-9. If MULTIPLE answers are marked correct, include ALL of them comma-separated
-10. Do NOT summarize - extract EXACT text from the images
-11. Return ONLY valid JSON, no explanation
+2. For MCQ: options = array with ALL choices separately ["A) ...", "B) ...", "C) ...", "D) ..."]
+3. For MCQ: Answer = ONLY letter(s). Single answer: "B". Multiple correct: "A,C"
+4. For SHORT/LONG: options = empty array []. Answer = the COMPLETE written answer text as found in the document. If this is an answer key, copy the full model answer. If this is a student response, copy exactly what the student wrote.
+5. For TRUE_FALSE: options = ["True", "False"]. Answer = "True" or "False"
+6. For FILL_BLANK: options = []. Answer = the word/phrase answer
+7. If a question starts on one page and continues on next, COMBINE them
+8. For code questions, include the ENTIRE code snippet in questionText
+9. Read ALL text carefully from ALL pages
+10. Include question numbers like "Q1", "1.", etc. in questionText
+11. If answer is marked/circled/ticked, extract it
+12. If MULTIPLE answers are marked correct for MCQ, include ALL of them comma-separated
+13. Do NOT summarize - extract EXACT text from the images
+14. For subjective answers, preserve the FULL text including all points, explanations, and examples
+15. Return ONLY valid JSON, no explanation
 
-CORRECT EXAMPLE:
+OBJECTIVE EXAMPLE:
 questionText: "Q.1) What is 2+2?"
+questionType: "MCQ"
 options: ["A) 3", "B) 4", "C) 5", "D) 6"]
 Answer: "B"
 
-MULTIPLE CORRECT EXAMPLE:
-questionText: "Q.2) Which are prime numbers?"
-options: ["A) 2", "B) 4", "C) 5", "D) 6"]
-Answer: "A,C"
+SUBJECTIVE SHORT EXAMPLE:
+questionText: "Q.3) Define polymorphism in OOP."
+questionType: "SHORT"
+options: []
+Answer: "Polymorphism is the ability of an object to take on many forms. In OOP, it allows methods to do different things based on the object that is calling them."
+
+SUBJECTIVE LONG EXAMPLE:
+questionText: "Q.5) Explain the different types of sorting algorithms with their time complexities."
+questionType: "LONG"
+options: []
+Answer: "Sorting algorithms can be classified into comparison-based and non-comparison-based... (full detailed answer)"
+
+TRUE/FALSE EXAMPLE:
+questionText: "Q.4) A stack follows FIFO principle."
+questionType: "TRUE_FALSE"
+options: ["True", "False"]
+Answer: "False"
 
 WRONG (DO NOT DO THIS):
 questionText: "Q.1) What is 2+2? A) 3 B) 4 C) 5 D) 6" (options should NOT be in questionText)"""
@@ -182,48 +210,77 @@ questionText: "Q.1) What is 2+2? A) 3 B) 4 C) 5 D) 6" (options should NOT be in 
 
         parsed = json.loads(json_text)
 
-        # Post-process to clean questionText (remove options from it)
+        # Post-process to clean questionText and answers based on question type
         if parsed.get("questions"):
             import re
             for q in parsed["questions"]:
+                # Normalize questionType
+                qtype = (q.get("questionType") or "MCQ").upper().strip()
+                type_mapping = {
+                    "MCQ": "MCQ",
+                    "MULTIPLE CHOICE": "MCQ",
+                    "MULTI CHOICE": "MCQ",
+                    "SHORT": "SHORT",
+                    "SHORT ANSWER": "SHORT",
+                    "LONG": "LONG",
+                    "LONG ANSWER": "LONG",
+                    "ESSAY": "LONG",
+                    "DESCRIPTIVE": "LONG",
+                    "TRUE_FALSE": "TRUE_FALSE",
+                    "TRUE/FALSE": "TRUE_FALSE",
+                    "TRUEFALSE": "TRUE_FALSE",
+                    "FILL_BLANK": "FILL_BLANK",
+                    "FILL IN THE BLANK": "FILL_BLANK",
+                    "FILL": "FILL_BLANK",
+                }
+                q["questionType"] = type_mapping.get(qtype, qtype)
+
                 if q.get("questionText"):
                     text = q["questionText"]
 
-                    # Pattern to find where options start: A) or A. or A: or (A)
-                    # Look for standalone option pattern like "A)" or "(A)" at word boundary
-                    option_patterns = [
-                        r'\s+[Aa]\s*[\)\.\:]',  # A) or A. or A:
-                        r'\s+\([Aa]\)',          # (A)
-                        r'\n[Aa]\s*[\)\.\:]',    # newline + A)
-                    ]
+                    # Only strip options from MCQ/TRUE_FALSE questions
+                    if q["questionType"] in ["MCQ", "TRUE_FALSE"]:
+                        option_patterns = [
+                            r'\s+[Aa]\s*[\)\.\:]',
+                            r'\s+\([Aa]\)',
+                            r'\n[Aa]\s*[\)\.\:]',
+                        ]
 
-                    for pattern in option_patterns:
-                        option_start = re.search(pattern, text)
-                        if option_start and q.get("options") and len(q["options"]) > 0:
-                            # Cut the questionText at the start of options
-                            q["questionText"] = text[:option_start.start()].strip()
-                            break
+                        for pattern in option_patterns:
+                            option_start = re.search(pattern, text)
+                            if option_start and q.get("options") and len(q["options"]) > 0:
+                                q["questionText"] = text[:option_start.start()].strip()
+                                break
 
-                # Clean Answer to be just the letter(s) - handle multiple correct answers
+                # Clean Answer based on question type
                 if q.get("Answer"):
-                    answer = str(q["Answer"]).upper().strip()
+                    answer = str(q["Answer"]).strip()
 
-                    # Extract all letters A-E from the answer
-                    letters = re.findall(r'[A-E]', answer)
+                    if q["questionType"] == "MCQ":
+                        # For MCQ: extract only letter(s)
+                        letters = re.findall(r'[A-Ea-e]', answer.upper())
+                        if letters:
+                            seen = set()
+                            unique_letters = []
+                            for letter in letters:
+                                if letter not in seen:
+                                    seen.add(letter)
+                                    unique_letters.append(letter)
+                            q["Answer"] = ",".join(unique_letters)
+                        else:
+                            q["Answer"] = ""
+                    elif q["questionType"] == "TRUE_FALSE":
+                        # Normalize to "True" or "False"
+                        if answer.lower() in ["true", "t", "yes"]:
+                            q["Answer"] = "True"
+                        elif answer.lower() in ["false", "f", "no"]:
+                            q["Answer"] = "False"
+                    # For SHORT, LONG, FILL_BLANK: keep the full text answer as-is
 
-                    if letters:
-                        # Remove duplicates while preserving order
-                        seen = set()
-                        unique_letters = []
-                        for letter in letters:
-                            if letter not in seen:
-                                seen.add(letter)
-                                unique_letters.append(letter)
-
-                        # Join with comma for multiple answers
-                        q["Answer"] = ",".join(unique_letters)
-                    else:
-                        q["Answer"] = ""
+                # Ensure options is an empty array for subjective types
+                if q["questionType"] in ["SHORT", "LONG", "FILL_BLANK"]:
+                    if not q.get("options") or (len(q.get("options", [])) > 0 and all(not opt.strip() for opt in q["options"])):
+                        q["options"] = []
 
         return parsed
 
