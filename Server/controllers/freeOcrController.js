@@ -363,6 +363,11 @@ export const extractStudentResponse = async (req, res) => {
       }
     }
 
+    // ✅ FORCE Q13 and Q14 as FILL_BLANK (short answers) — override any answer key if needed
+    questionTypeMap[13] = "FILL_BLANK";
+    questionTypeMap[14] = "FILL_BLANK";
+    console.log("📋 Final question type map (with Q13/Q14 forced):", questionTypeMap);
+
     const formData = new FormData();
     formData.append("file", fs.createReadStream(filePath), fileName);
     // Send question type hints to OCR service

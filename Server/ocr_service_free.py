@@ -380,68 +380,31 @@ def post_process_question(q: dict, idx: int, question_types: dict = None) -> dic
     # ── questionType ────────────────────────────────────────────────────
     q["questionType"] = normalize_question_type(q.get("questionType", "MCQ"))
 
-    # ── Route to type-specific post-processing ───────────────────────────
-    if q["questionType"] == "MCQ":
-        return post_process_mcq(q, idx)
-    else:
-        return post_process_subjective(q, idx)
-
-
-def post_process_mcq(q: dict, idx: int) -> dict:
-    """Stricter post-processing for MCQs to avoid extracting unmarked options."""
     # ── Answer ──────────────────────────────────────────────────────────
-    raw_ans = q.get("Answer")
-    q["Answer"] = normalize_answer(raw_ans)
-
-    # Stricter: Only allow A-D letters, and limit to 1-2 selections max (to avoid false positives)
-    if q["Answer"]:
-        letters = re.findall(r'[A-D]', q["Answer"].upper())
-        seen, unique = set(), []
-        for l in letters:
-            if l not in seen:
-                seen.add(l)
-                unique.append(l)
-        # If more than 2 options selected, likely false positive — set to empty
-        if len(unique) > 2:
-            print(f"  ⚠️  Q{q.get('questionNumber', idx)} [MCQ]: Detected {len(unique)} options marked, likely false positive — setting Answer to ''")
-            q["Answer"] = ""
-        else:
-            q["Answer"] = ",".join(unique)
-
-    # ── options ─────────────────────────────────────────────────────────
-    if q.get("options") is None:
-        q["options"] = []
-
-    # ── Strip option bleed from questionText ────────────────────────────
-    if q.get("questionText") and q.get("options") and len(q["options"]) > 0:
-        text = q["questionText"]
-        for pat in [r'\s+[Aa]\s*[\)\.\:]', r'\s+\([Aa]\)', r'\n[Aa]\s*[\)\.\:]']:
-            m = re.search(pat, text)
-            if m:
-                q["questionText"] = text[:m.start()].strip()
-                break
-
-    # ── Debug log ────────────────────────────────────────────────────────
-    print(f"  📌 Q{q['questionNumber']} [{q['questionType']}]: Answer={q['Answer']!r}  (raw={raw_ans!r})")
-    return q
-
-
-def post_process_subjective(q: dict, idx: int) -> dict:
-    """Lenient post-processing for subjective questions (SHORT, LONG, FILL_BLANK, TRUE_FALSE)."""
-    # ── Answer ──────────────────────────────────────────────────────────
-    raw_ans = q.get("Answer")
+    raw_ans    = q.get("Answer")
     q["Answer"] = normalize_answer(raw_ans)
 
     # If Groq labeled it as MCQ but the answer is not a letter/letter-list,
     # treat it as a fill-in-the-blank (common for questions like Q13/14).
-    # (This can happen if hints are wrong)
     if q["questionType"] == "MCQ":
         ans = q.get("Answer", "").strip()
         if ans and not re.fullmatch(r'[A-D](?:,[A-D])*', ans):
             q["questionType"] = "FILL_BLANK"
             q["options"] = []
 
+    # For MCQ: only allow A-D (standard 4-option paper), strip E and beyond
+    if q["questionType"] == "MCQ" and q["Answer"]:
+        letters = re.findall(r'[A-D]', q["Answer"].upper())
+        seen, unique = set(), []
+        for l in letters:
+            if l not in seen:
+                seen.add(l)
+                unique.append(l)
+        q["Answer"] = ",".join(unique) if unique else ""
+
     # For TRUE_FALSE: normalize casing of the T/F part but PRESERVE justification.
+    # e.g. "true - probability of collision is 5 times less" → "True - probability of collision is 5 times less"
+    # Also cross-check: if justification clearly implies True/False, use that to verify.
     if q["questionType"] == "TRUE_FALSE" and q["Answer"]:
         ans = q["Answer"].strip()
         tf_match = re.match(r'^(true|false|t|f)\b(.*)$', ans, re.IGNORECASE)
@@ -450,10 +413,14 @@ def post_process_subjective(q: dict, idx: int) -> dict:
             remainder = tf_match.group(2)
             canonical = "True" if tf_part in ("true", "t") else "False"
             # ── Semantic cross-check for cursive misreads ──────────────────
+            # If the justification strongly implies the opposite of what was read,
+            # Groq likely misread the cursive T/F word. Correct it.
             just_lower = remainder.lower()
+            # Signals that clearly mean TRUE (positive statements about the claim)
             true_signals  = ["5 times less", "five times less", "higher throughput",
                              "lower collision", "increased throughput", "less collision",
                              "probability.*less", "better performance"]
+            # Signals that clearly mean FALSE (negative statements about the claim)
             false_signals = ["not.*higher", "does not have higher", "lower throughput",
                              "no.*increase", "throughput.*lower", "not increased"]
             just_implies_true  = any(re.search(sig, just_lower) for sig in true_signals)
@@ -465,15 +432,16 @@ def post_process_subjective(q: dict, idx: int) -> dict:
                 print(f"  ⚠️  Q{q.get('questionNumber','?')} [TRUE_FALSE]: Justification implies FALSE but Groq read TRUE — correcting to False")
                 canonical = "False"
             q["Answer"] = canonical + remainder
+        # If no T/F detected at all, leave as-is (let evaluator handle it)
 
     # ── options ─────────────────────────────────────────────────────────
     if q.get("options") is None:
         q["options"] = []
-    # Subjective types should always have empty options
+    # Subjective types should always have empty options (v1)
     if q["questionType"] in ("SHORT", "LONG", "FILL_BLANK"):
         q["options"] = []
 
-    # ── Strip option bleed from questionText (if applicable) ─────────────
+    # ── Strip option bleed from questionText (v6) ───────────────────────
     if q.get("questionText") and q.get("options") and len(q["options"]) > 0:
         text = q["questionText"]
         for pat in [r'\s+[Aa]\s*[\)\.\:]', r'\s+\([Aa]\)', r'\n[Aa]\s*[\)\.\:]']:
@@ -485,6 +453,7 @@ def post_process_subjective(q: dict, idx: int) -> dict:
     # ── Debug log ────────────────────────────────────────────────────────
     print(f"  📌 Q{q['questionNumber']} [{q['questionType']}]: Answer={q['Answer']!r}  (raw={raw_ans!r})")
     return q
+
 
 
 def post_process_questions(questions: list) -> list:
