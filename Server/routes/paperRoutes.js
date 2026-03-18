@@ -12,12 +12,11 @@ import {
   deletePaper,
   // Key upload
   uploadKey,
-  saveKeyData,
   // Student response upload
   uploadStudentResponse,
   uploadBulkStudentResponses,
-  saveResponseData,
   deleteStudentResponse,
+  deleteStudentResultById,
   deleteAllStudentResponses,
   // Evaluation
   evaluatePaper,
@@ -25,9 +24,16 @@ import {
   // Question bank
   getSubjectQuestionBank,
   getAllQuestionBanks,
+  deleteAllQuestions,
   // Difficulty analysis
   getPaperDifficultyAnalysis
 } from "../controllers/paperController.js";
+
+// Groq-related functions from freeOcrController
+import {
+  saveKeyData,
+  saveResponseData
+} from "../controllers/freeOcrController.js";
 
 const router = express.Router();
 
@@ -75,6 +81,7 @@ router.post("/papers/:paperId/response", upload.single("file"), uploadStudentRes
 router.post("/papers/:paperId/responses", upload.array("files", 50), uploadBulkStudentResponses);
 router.post("/papers/:paperId/response-data", saveResponseData); // Save pre-extracted response data (from Groq)
 router.delete("/papers/:paperId/students/:enrollmentNumber", deleteStudentResponse);
+router.delete("/papers/:paperId/results/:resultId", deleteStudentResultById);
 router.delete("/papers/:paperId/students", deleteAllStudentResponses);
 
 // ==================== EVALUATION ====================
@@ -84,6 +91,7 @@ router.get("/papers/:paperId/results", getPaperResults);
 // ==================== QUESTION BANK ====================
 router.get("/question-bank", getAllQuestionBanks);
 router.get("/subjects/:subjectId/question-bank", getSubjectQuestionBank);
+router.delete("/subjects/:subjectId/question-bank", deleteAllQuestions);
 
 // ==================== DIFFICULTY ANALYSIS ====================
 router.get("/papers/:paperId/analysis", getPaperDifficultyAnalysis);

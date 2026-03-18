@@ -3,13 +3,17 @@ import mongoose from "mongoose";
 const QuestionStatSchema = new mongoose.Schema({
   questionNumber: Number,
   questionText: String,
+  questionType: String,  // MCQ, SHORT, LONG, TRUE_FALSE
   correctAnswer: String,
   studentAnswer: String,
   marks: Number,
   obtained: Number,
   isCorrect: Boolean,
   isFullMarks: Boolean,
-  isPartial: Boolean
+  isPartial: Boolean,
+  feedback: String,  // For subjective evaluation feedback
+  correctPoints: [String],  // Points student got right
+  missingPoints: [String]   // Points student missed
 });
 
 const SummarySchema = new mongoose.Schema({

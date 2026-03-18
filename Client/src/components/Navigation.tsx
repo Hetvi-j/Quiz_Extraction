@@ -19,7 +19,7 @@ import { useAuth } from "@/context/AuthContext"; // adjust path as needed
 const navItemsLoggedIn = [
   { to: "/", label: "Home", icon: Home },
   { to: "/subjects", label: "Subjects", icon: GraduationCap },
-  { to: "/question-bank", label: "Question Bank", icon: Library },
+  // { to: "/question-bank", label: "Question Bank", icon: Library },
   { to: "/quiz-create", label: "Create Quiz", icon: PlusCircle },
   { to: "/quizzes", label: "Take Quiz", icon: BookOpen },
   { to: "/profile", label: "Profile", icon: User },

@@ -8,71 +8,6 @@ import Upload from "../models/Upload.js";
 import SubjectQuiz from "../models/SubjectQuiz.js";
 import { addToQuestionBank } from "./questionBankController.js";
 
-// --- Tolerant comparison helpers ---
-const normalizeText = (s = "") => {
-  if (s === null || s === undefined) return "";
-  let t = String(s).normalize("NFKD").toLowerCase().trim();
-  // small number words
-  const numWords = {
-    zero: '0', one: '1', two: '2', three: '3', four: '4', five: '5',
-    six: '6', seven: '7', eight: '8', nine: '9', ten: '10'
-  };
-  t = t.replace(/\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten)\b/g, m => numWords[m] || m);
-  // remove punctuation except dot and minus
-  t = t.replace(/[^\w\s\.-]/g, ' ');
-  t = t.replace(/\s+/g, ' ').trim();
-  return t;
-};
-
-const isNumber = (s) => {
-  if (s === null || s === undefined) return false;
-  return !isNaN(Number(String(s).trim()));
-};
-
-const numericSimilar = (a, b, relTol = 0.01) => {
-  try {
-    const na = Number(a);
-    const nb = Number(b);
-    if (!isFinite(na) || !isFinite(nb)) return false;
-    return Math.abs(na - nb) <= Math.max(relTol * Math.max(Math.abs(na), Math.abs(nb)), relTol);
-  } catch (e) {
-    return false;
-  }
-};
-
-// simple Levenshtein distance
-const levenshtein = (a, b) => {
-  a = a || '';
-  b = b || '';
-  const al = a.length, bl = b.length;
-  if (al === 0) return bl;
-  if (bl === 0) return al;
-  const dp = Array.from({ length: al + 1 }, () => new Array(bl + 1).fill(0));
-  for (let i = 0; i <= al; i++) dp[i][0] = i;
-  for (let j = 0; j <= bl; j++) dp[0][j] = j;
-  for (let i = 1; i <= al; i++) {
-    for (let j = 1; j <= bl; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
-    }
-  }
-  return dp[al][bl];
-};
-
-const similarity = (a, b) => {
-  if (!a && !b) return 1.0;
-  a = String(a || ''); b = String(b || '');
-  if (a === b) return 1.0;
-  const dist = levenshtein(a, b);
-  const maxLen = Math.max(a.length, b.length);
-  if (maxLen === 0) return 1.0;
-  return Math.max(0, 1 - dist / maxLen);
-};
-
-// thresholds: >=0.85 full, >=0.7 partial
-const FULL_SIM = 0.85;
-const PARTIAL_SIM = 0.7;
-
 // Helper function to mask enrollment number (hide last 5 digits)
 const maskEnrollment = (enrollment) => {
   if (!enrollment) return enrollment;
@@ -265,7 +200,6 @@ const processFileWithLandingAI = async (filePath, fileName) => {
   if (!markdown) {
     throw new Error("No markdown returned from parse API");
   }
-  console.log(`LandingAI parse returned markdown length: ${String(markdown).length}`);
 
   // STEP 2: Extract structured data
   const formExtract = new FormData();
@@ -282,15 +216,6 @@ const processFileWithLandingAI = async (filePath, fileName) => {
       }
     }
   );
-
-  // Debug: log extraction summary
-  try {
-    const extractionPreview = extractResponse.data.extraction || {};
-    const qcount = Array.isArray(extractionPreview.questions) ? extractionPreview.questions.length : 0;
-    console.log(`LandingAI extract: found ${qcount} question(s) in ${fileName}`);
-  } catch (e) {
-    console.warn('Could not parse LandingAI extract response summary:', e.message);
-  }
 
   return extractResponse.data.extraction || {};
 };
@@ -564,54 +489,17 @@ const evaluateStudentAnswers = (studentAnswers, answerKey) => {
       };
     }
 
-    const studentAnsRaw = sa.studentAnswer || sa.Answer || '';
-    const correctAnsRaw = keyQuestion.correctAnswer || '';
-    const studentAns = normalizeText(studentAnsRaw);
-    const correctAns = normalizeText(correctAnsRaw);
+    const studentAns = (sa.studentAnswer || sa.Answer || '').toString().toLowerCase().trim();
+    const correctAns = (keyQuestion.correctAnswer || '').toString().toLowerCase().trim();
 
-    // Handle multi-correct options
-    const correctOptions = correctAns.split(',').map(a => a.trim()).filter(Boolean);
+    // Check if correct (handle multiple correct answers separated by comma)
+    const correctOptions = correctAns.split(',').map(a => a.trim());
+    const isCorrect = correctOptions.some(opt => opt === studentAns);
 
     const marks = keyQuestion.marks || 1;
     totalMarks += marks;
 
-    let isCorrect = false;
-    let marksObtained = 0;
-
-    // If both numeric, compare numerically
-    if (isNumber(correctAns) && isNumber(studentAns)) {
-      if (numericSimilar(correctAns, studentAns)) {
-        isCorrect = true;
-        marksObtained = marks;
-      } else {
-        // partial proportional score for numeric closeness
-        const a = Number(correctAns);
-        const b = Number(studentAns);
-        const ratio = Math.max(0, 1 - Math.abs(a - b) / (Math.abs(a) + 1e-9));
-        marksObtained = Math.round(ratio * marks * 100) / 100;
-        isCorrect = marksObtained >= marks;
-      }
-    } else {
-      // Compare against each correct option using similarity
-      let bestSim = 0;
-      for (const opt of correctOptions.length ? correctOptions : [correctAns]) {
-        if (!opt) continue;
-        const sim = similarity(opt, studentAns);
-        if (sim > bestSim) bestSim = sim;
-      }
-
-      if (bestSim >= FULL_SIM) {
-        isCorrect = true;
-        marksObtained = marks;
-      } else if (bestSim >= PARTIAL_SIM) {
-        isCorrect = false;
-        marksObtained = Math.round(bestSim * marks * 100) / 100;
-      } else {
-        isCorrect = false;
-        marksObtained = 0;
-      }
-    }
-
+    const marksObtained = isCorrect ? marks : 0;
     obtainedMarks += marksObtained;
 
     return {
@@ -977,8 +865,8 @@ const calculateQuizDifficulty = (quiz) => {
   const variance = percentages.reduce((sum, p) => sum + Math.pow(p - avgPercentage, 2), 0) / percentages.length;
   const stdDev = Math.sqrt(variance);
 
-  // Question-wise analysis
-  const questionStats = [];
+  // Question-wise analysis - Step 1: Collect accuracy data
+  const questionData = [];
   quiz.questions.forEach((question, idx) => {
     const questionNum = question.questionNumber || idx + 1;
     let correctCount = 0;
@@ -993,26 +881,39 @@ const calculateQuizDifficulty = (quiz) => {
     });
 
     const accuracy = totalAttempts > 0 ? (correctCount / totalAttempts) * 100 : 0;
-    let difficulty = 'HARD';
-    if (accuracy >= 80) difficulty = 'EASY';
-    else if (accuracy >= 50) difficulty = 'MEDIUM';
-
-    questionStats.push({
+    questionData.push({
       questionNumber: questionNum,
       questionText: question.questionText?.substring(0, 50) + '...',
       correctCount,
       totalAttempts,
-      accuracy: Math.round(accuracy * 100) / 100,
-      difficulty,
+      accuracy,
       marks: question.marks
     });
   });
 
-  // Calculate overall difficulty
-  const avgAccuracy = questionStats.reduce((sum, q) => sum + q.accuracy, 0) / questionStats.length;
-  let overallDifficulty = 'HARD';
-  if (avgAccuracy >= 75 && stdDev < 15) overallDifficulty = 'EASY';
-  else if (avgAccuracy >= 45 && stdDev < 25) overallDifficulty = 'MEDIUM';
+  // Step 2: Calculate Mean (μ) and Standard Deviation (σ) for question accuracies
+  const accuracies = questionData.map(q => q.accuracy);
+  const mean = accuracies.length > 0 ? accuracies.reduce((sum, acc) => sum + acc, 0) / accuracies.length : 0;
+  const accVariance = accuracies.length > 0 ? accuracies.reduce((sum, acc) => sum + Math.pow(acc - mean, 2), 0) / accuracies.length : 0;
+  const accStdDev = Math.sqrt(accVariance);
+
+  // Step 3: Classify using Normal Distribution Zones
+  // Easy: x ≥ μ (top 50%), Medium: μ - σ ≤ x < μ (~34.1%), Hard: x < μ - σ (bottom ~15.9%)
+  const questionStats = questionData.map(q => {
+    let difficulty;
+    if (q.accuracy >= mean) difficulty = 'EASY';
+    else if (q.accuracy >= (mean - accStdDev)) difficulty = 'MEDIUM';
+    else difficulty = 'HARD';
+
+    return { ...q, accuracy: Math.round(q.accuracy * 100) / 100, difficulty };
+  });
+
+  // Calculate overall difficulty using the same μ/σ logic
+  const avgAccuracy = mean;
+  let overallDifficulty;
+  if (avgAccuracy >= mean) overallDifficulty = 'EASY';
+  else if (avgAccuracy >= (mean - accStdDev)) overallDifficulty = 'MEDIUM';
+  else overallDifficulty = 'HARD';
 
   // Quiz Intelligence Score (QIS)
   const difficultyIndex = 1 - (avgAccuracy / 100);
@@ -1055,14 +956,15 @@ const calculateQuizDifficulty = (quiz) => {
 };
 
 /**
- * Update question difficulties based on actual performance
+ * Update question difficulties based on actual performance using μ/σ-based zones
  */
 const updateQuestionDifficulties = (quiz) => {
   const evaluatedAttempts = quiz.attempts.filter(a => a.status === 'EVALUATED');
 
   if (evaluatedAttempts.length < 3) return; // Need at least 3 attempts for meaningful data
 
-  quiz.questions.forEach((question, idx) => {
+  // Step 1: Collect accuracy data for all questions
+  const questionAccuracies = quiz.questions.map((question, idx) => {
     const questionNum = question.questionNumber || idx + 1;
     let correctCount = 0;
     let totalAttempts = 0;
@@ -1075,10 +977,20 @@ const updateQuestionDifficulties = (quiz) => {
       }
     });
 
-    const accuracy = totalAttempts > 0 ? (correctCount / totalAttempts) * 100 : 50;
+    return totalAttempts > 0 ? (correctCount / totalAttempts) * 100 : 50;
+  });
 
-    if (accuracy >= 80) question.difficulty = 'EASY';
-    else if (accuracy >= 50) question.difficulty = 'MEDIUM';
+  // Step 2: Calculate Mean (μ) and Standard Deviation (σ)
+  const mean = questionAccuracies.reduce((sum, acc) => sum + acc, 0) / questionAccuracies.length;
+  const variance = questionAccuracies.reduce((sum, acc) => sum + Math.pow(acc - mean, 2), 0) / questionAccuracies.length;
+  const stdDev = Math.sqrt(variance);
+
+  // Step 3: Classify using Normal Distribution Zones
+  // Easy: x ≥ μ (top 50%), Medium: μ - σ ≤ x < μ (~34.1%), Hard: x < μ - σ (bottom ~15.9%)
+  quiz.questions.forEach((question, idx) => {
+    const accuracy = questionAccuracies[idx];
+    if (accuracy >= mean) question.difficulty = 'EASY';
+    else if (accuracy >= (mean - stdDev)) question.difficulty = 'MEDIUM';
     else question.difficulty = 'HARD';
   });
 };

@@ -8,13 +8,6 @@ import Paper from "../models/Paper.js";
 import Result from "../models/Result.js";
 import QuestionBank from "../models/QuestionBank.js";
 
-// Helper function to mask enrollment number (hide last 5 digits)
-const maskEnrollment = (enrollment) => {
-  if (!enrollment) return enrollment;
-  const str = enrollment.toString();
-  if (str.length <= 5) return '*'.repeat(str.length);
-  return str.slice(0, -5) + '*****';
-};
 
 const VA_API_KEY = process.env.LANDING_AI_API_KEY || "bnoxd3ozb2VsanV2OHZoNTJuc3g2Om1CWXRlVzVYeUh5bEdQa28yajdZcWs2VUNiSU5uY0hw"
 
@@ -447,18 +440,21 @@ export const uploadKey = async (req, res) => {
     // Calculate total marks
     let totalMarks = questions.reduce((sum, q) => sum + q.marks, 0);
 
-    // If totalMarks from document differs from calculated, use document's value as fallback
-    if (extraction.documentInfo?.totalMarks && !totalMarks) {
-      totalMarks = extraction.documentInfo.totalMarks;
-      console.log(`ℹ️ Using totalMarks from document: ${totalMarks}`);
-    }
+    // If no questions extracted but we have totalMarks from documentInfo, create placeholder questions
+    if (questions.length === 0 && extraction.documentInfo?.totalMarks) {
+      const numQuestions = Number(extraction.documentInfo.totalMarks) || 6;
+      console.log(`⚠️ No questions extracted, creating ${numQuestions} placeholder questions from totalMarks`);
 
-    // ⚠️ REMOVED PLACEHOLDER GENERATION: If extraction fails, return error instead
-    if (questions.length === 0) {
-      console.warn(`❌ CRITICAL: Landing AI returned 0 questions from: ${fileName}`);
-      console.warn(`Extraction dump:`, JSON.stringify(extraction, null, 2));
-      // Do NOT create placeholders — return error so you can debug the actual issue
-      throw new Error(`Landing AI failed to extract any questions from ${fileName}. Check file format and try uploading the file via Groq instead.`);
+      for (let i = 1; i <= numQuestions; i++) {
+        questions.push({
+          questionText: `Question ${i}`,
+          questionType: "MCQ",
+          marks: 1,
+          options: [],
+          answer: ""
+        });
+      }
+      totalMarks = numQuestions;
     }
 
     console.log(`✅ Total: ${questions.length} questions, ${totalMarks} marks`);
@@ -487,117 +483,6 @@ export const uploadKey = async (req, res) => {
     });
   } catch (error) {
     console.error("Key upload error:", error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// Save key data from external OCR (Groq)
-export const saveKeyData = async (req, res) => {
-  try {
-    const { paperId } = req.params;
-    const { questions, documentInfo, totalMarks, fileName } = req.body;
-
-    const paper = await Paper.findById(paperId).populate("subject");
-    if (!paper) {
-      return res.status(404).json({ success: false, message: "Paper not found" });
-    }
-
-    console.log("\n========== SAVING KEY DATA (Groq) ==========");
-    console.log("Paper:", paper.paperName);
-    console.log("Questions:", questions?.length || 0);
-
-    // Format questions for storage
-    const formattedQuestions = (questions || []).map(q => ({
-      questionText: q.questionText,
-      questionType: q.questionType || "MCQ",
-      marks: Number(q.marks) || 1,
-      options: q.options || [],
-      answer: q.answer || q.Answer || ""
-    }));
-
-    // Calculate total marks if not provided
-    const calculatedTotalMarks = totalMarks || formattedQuestions.reduce((sum, q) => sum + q.marks, 0);
-
-    // Update paper with key
-    paper.key = {
-      fileName: fileName || "groq_extracted",
-      questions: formattedQuestions,
-      uploadedAt: new Date()
-    };
-    paper.totalMarks = calculatedTotalMarks;
-
-    await paper.save();
-
-    // Add questions to question bank for this subject
-    await addQuestionsToBank(paper.subject._id, paper.subject.name, formattedQuestions, paper._id, fileName);
-
-    console.log(`✅ Saved: ${formattedQuestions.length} questions, ${calculatedTotalMarks} marks`);
-
-    res.status(200).json({
-      success: true,
-      message: "Answer key saved successfully",
-      totalQuestions: formattedQuestions.length,
-      totalMarks: calculatedTotalMarks
-    });
-  } catch (error) {
-    console.error("Save key data error:", error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// Save student response data from external OCR (Groq)
-export const saveResponseData = async (req, res) => {
-  try {
-    const { paperId } = req.params;
-    const { enrollmentNumber, answers, fileName } = req.body;
-
-    const paper = await Paper.findById(paperId);
-    if (!paper) {
-      return res.status(404).json({ success: false, message: "Paper not found" });
-    }
-
-    console.log(`\n========== SAVING RESPONSE DATA (Groq) ==========`);
-    console.log(`Enrollment: ${enrollmentNumber}, Answers: ${answers?.length || 0}`);
-
-    // Format answers as questions
-    const questions = (answers || []).map(a => ({
-      questionText: a.questionText || `Question ${a.questionNumber}`,
-      questionType: "MCQ",
-      marks: 1,
-      options: [],
-      answer: a.answer || ""
-    }));
-
-    // Check if student already submitted
-    const existingIndex = paper.studentResponses.findIndex(
-      sr => sr.enrollmentNumber === enrollmentNumber
-    );
-
-    if (existingIndex >= 0) {
-      paper.studentResponses[existingIndex] = {
-        enrollmentNumber,
-        fileName: fileName || "groq_extracted",
-        questions,
-        submittedAt: new Date()
-      };
-    } else {
-      paper.studentResponses.push({
-        enrollmentNumber,
-        fileName: fileName || "groq_extracted",
-        questions,
-        submittedAt: new Date()
-      });
-    }
-
-    await paper.save();
-
-    res.status(200).json({
-      success: true,
-      message: `Student response saved for ${enrollmentNumber}`,
-      totalAnswers: questions.length
-    });
-  } catch (error) {
-    console.error("Save response data error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -804,6 +689,41 @@ export const deleteStudentResponse = async (req, res) => {
   }
 };
 
+// Delete a student result by result ID
+export const deleteStudentResultById = async (req, res) => {
+  try {
+    const { paperId, resultId } = req.params;
+
+    // Find the result first to get the enrollment number
+    const result = await Result.findById(resultId);
+    if (!result) {
+      return res.status(404).json({ success: false, message: "Result not found" });
+    }
+
+    const paper = await Paper.findById(paperId);
+    if (!paper) {
+      return res.status(404).json({ success: false, message: "Paper not found" });
+    }
+
+    // Delete the student response from paper
+    paper.studentResponses = paper.studentResponses.filter(
+      sr => sr.enrollmentNumber !== result.enrollmentNumber
+    );
+    await paper.save();
+
+    // Delete the result
+    await Result.findByIdAndDelete(resultId);
+
+    res.status(200).json({
+      success: true,
+      message: `Deleted student result`,
+      totalStudents: paper.studentResponses.length
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 // Delete all student responses
 export const deleteAllStudentResponses = async (req, res) => {
   try {
@@ -855,9 +775,34 @@ export const evaluatePaper = async (req, res) => {
     const totalMarks = paper.totalMarks;
     const allResults = [];
 
-    // Normalization function
-    const normalize = (str = "") =>
-      str.toLowerCase().replace(/^option\s*[a-d]:\s*/i, "").replace(/[^a-z0-9]+/g, "").trim();
+    // Helper to extract option letter(s) from answer like "B", "A,C", "A,B,D,E"
+    const extractLetters = (answer) => {
+      if (!answer) return [];
+      const str = answer.toString().toUpperCase().trim();
+
+      // Check if answer looks like comma-separated options (e.g., "A,B", "A,C,D", "A,B,C,D,E")
+      // This handles multi-select MCQs with 2, 3, 4, or 5 correct options
+      const commaPattern = /^[A-E]([\s]*,[\s]*[A-E])+$/;
+      if (commaPattern.test(str)) {
+        const letters = str.match(/[A-E]/g) || [];
+        return [...new Set(letters)];
+      }
+
+      // Short answer like "B" or "AC"
+      if (str.length <= 3) {
+        const letters = str.match(/[A-E]/g) || [];
+        return [...new Set(letters)];
+      }
+
+      // Single letter followed by delimiter (e.g., "B - explanation")
+      const match = str.match(/^([A-E])[\s,\-\.\)\:]/);
+      if (match) return [match[1]];
+
+      // Fallback: extract all letters A-E from first 15 chars
+      const firstPart = str.substring(0, 15);
+      const letters = firstPart.match(/[A-E]/g) || [];
+      return [...new Set(letters)];
+    };
 
     for (const studentResponse of paper.studentResponses) {
       const questionStats = answerKey.map((q, i) => ({
@@ -877,37 +822,144 @@ export const evaluatePaper = async (req, res) => {
       let partialCorrect = 0;
       let wrong = 0;
 
+      // Helper to normalize text for subjective answer comparison
+      const normalizeAnswer = (text) => {
+        if (!text) return "";
+        return text.toString().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      };
+
       for (let i = 0; i < studentResponse.questions.length && i < questionStats.length; i++) {
         const studentQ = studentResponse.questions[i];
         const correctQ = questionStats[i];
+        const keyQuestion = answerKey[i];
+        const questionType = (keyQuestion.questionType || "MCQ").toUpperCase();
 
-        // Multi-select support with partial marking
-        let correctAnswers = correctQ.correctAnswer.split(",").map(a => a.trim().toUpperCase()).filter(a => a);
-        let studentAnswers = (studentQ.answer || "").split(",").map(a => a.trim().toUpperCase()).filter(a => a);
-
-        // Calculate partial marks
-        const perOptionMark = correctQ.marks / Math.max(correctAnswers.length, 1);
         let obtainedForQuestion = 0;
-        let correctCount = 0;
 
-        // Check each correct answer
-        correctAnswers.forEach(correctOpt => {
-          if (studentAnswers.includes(correctOpt)) {
-            obtainedForQuestion += perOptionMark;
-            correctCount++;
+        if (questionType === "MCQ") {
+          // MCQ: Extract letters for comparison (handles "B - Because..." format)
+          let correctAnswers = extractLetters(correctQ.correctAnswer);
+          let studentAnswers = extractLetters(studentQ.answer || "");
+
+          // Calculate partial marks
+          const perOptionMark = correctQ.marks / Math.max(correctAnswers.length, 1);
+
+          // Check each correct answer
+          correctAnswers.forEach(correctOpt => {
+            if (studentAnswers.includes(correctOpt)) {
+              obtainedForQuestion += perOptionMark;
+            }
+          });
+
+          correctQ.studentAnswer = studentAnswers.join(",") || (studentQ.answer || "").trim();
+        } else if (questionType === "TRUE_FALSE") {
+          // TRUE_FALSE: Can be simple (True/False) or with justify
+          const correctAns = (correctQ.correctAnswer || "").toString();
+          const studentAns = (studentQ.answer || "").toString();
+
+          // Extract True/False part
+          const extractTrueFalse = (text) => {
+            const lower = text.toLowerCase().trim();
+            if (lower.startsWith("true") || lower.startsWith("t ") || lower === "t") return "true";
+            if (lower.startsWith("false") || lower.startsWith("f ") || lower === "f") return "false";
+            return "";
+          };
+
+          // Extract justify part (everything after True/False)
+          const extractJustify = (text) => {
+            const lower = text.toLowerCase().trim();
+            let justify = lower
+              .replace(/^(true|false|t|f)[\s\-\.\,\:\;]*/i, "")
+              .replace(/^(because|reason|as|since)[\s\-\.\,\:\;]*/i, "")
+              .trim();
+            return justify;
+          };
+
+          const correctTF = extractTrueFalse(correctAns);
+          const studentTF = extractTrueFalse(studentAns);
+          const correctJustify = normalizeAnswer(extractJustify(correctAns));
+          const studentJustify = normalizeAnswer(extractJustify(studentAns));
+
+          // Check if it has justify component
+          const hasJustify = correctJustify.length > 3;
+
+          if (hasJustify) {
+            // Split marks: 40% for True/False, 60% for justify
+            const tfMarks = correctQ.marks * 0.4;
+            const justifyMarks = correctQ.marks * 0.6;
+
+            // Check True/False part
+            if (correctTF && studentTF && correctTF === studentTF) {
+              obtainedForQuestion += tfMarks;
+            }
+
+            // Check justify part using word overlap
+            if (correctJustify && studentJustify) {
+              const correctWords = correctJustify.split(/\s+/).filter(w => w.length > 2);
+              const studentWords = studentJustify.split(/\s+/).filter(w => w.length > 2);
+
+              if (correctWords.length > 0 && studentWords.length > 0) {
+                let matchCount = 0;
+                correctWords.forEach(word => {
+                  if (studentWords.some(sw => sw.includes(word) || word.includes(sw))) {
+                    matchCount++;
+                  }
+                });
+
+                const matchRatio = matchCount / correctWords.length;
+                if (matchRatio >= 0.7) {
+                  obtainedForQuestion += justifyMarks;
+                } else if (matchRatio >= 0.4) {
+                  obtainedForQuestion += justifyMarks * 0.5;
+                }
+              }
+            }
+          } else {
+            // Simple True/False without justify
+            if (correctTF && studentTF && correctTF === studentTF) {
+              obtainedForQuestion = correctQ.marks;
+            }
           }
-        });
 
-        // Deduct for wrong answers (negative marking optional)
-        // const wrongAnswers = studentAnswers.filter(a => !correctAnswers.includes(a));
-        // if (wrongAnswers.length > 0) {
-        //   obtainedForQuestion = Math.max(0, obtainedForQuestion - (wrongAnswers.length * perOptionMark * 0.25));
-        // }
+          correctQ.studentAnswer = (studentQ.answer || "").trim();
+        } else {
+          // SHORT/LONG (Subjective): Compare normalized text answers
+          const correctText = normalizeAnswer(correctQ.correctAnswer);
+          const studentText = normalizeAnswer(studentQ.answer || "");
+
+          if (correctText && studentText) {
+            // Check for exact match (after normalization)
+            if (studentText === correctText) {
+              obtainedForQuestion = correctQ.marks;
+            } else {
+              // Check for significant overlap (student answer contains key parts of correct answer)
+              const correctWords = correctText.split(/\s+/).filter(w => w.length > 2);
+              const studentWords = studentText.split(/\s+/).filter(w => w.length > 2);
+
+              if (correctWords.length > 0) {
+                let matchCount = 0;
+                correctWords.forEach(word => {
+                  if (studentWords.some(sw => sw.includes(word) || word.includes(sw))) {
+                    matchCount++;
+                  }
+                });
+
+                const matchRatio = matchCount / correctWords.length;
+                if (matchRatio >= 0.8) {
+                  obtainedForQuestion = correctQ.marks; // Full marks for 80%+ match
+                } else if (matchRatio >= 0.5) {
+                  obtainedForQuestion = correctQ.marks * 0.5; // Half marks for 50%+ match
+                }
+              }
+            }
+          }
+
+          correctQ.studentAnswer = (studentQ.answer || "").trim();
+        }
 
         // Round to 2 decimal places
         obtainedForQuestion = Math.round(obtainedForQuestion * 100) / 100;
 
-        correctQ.studentAnswer = studentAnswers.join(", ");
         correctQ.obtained = obtainedForQuestion;
         correctQ.isCorrect = obtainedForQuestion > 0;
         correctQ.isFullMarks = obtainedForQuestion === correctQ.marks;
@@ -973,8 +1025,9 @@ export const evaluatePaper = async (req, res) => {
     // Update question difficulty in QuestionBank
     await updateQuestionDifficulty(paper.subject._id, answerKey, allResults);
 
-    // Calculate question-wise difficulty for response
-    const questionDifficulty = answerKey.map((q, i) => {
+    // Calculate question-wise difficulty for response using μ/σ-based zones
+    // Step 1: Collect accuracy data for all questions
+    const questionData = answerKey.map((q, i) => {
       let correct = 0, partial = 0, wrong = 0;
       allResults.forEach(r => {
         if (r.questionStats && r.questionStats[i]) {
@@ -984,22 +1037,25 @@ export const evaluatePaper = async (req, res) => {
         }
       });
       const accuracy = (correct / allResults.length) * 100;
-      return {
-        questionNumber: i + 1,
-        questionText: q.questionText,
-        correct,
-        partial,
-        wrong,
-        accuracy: Math.round(accuracy * 100) / 100,
-        difficulty: accuracy >= 70 ? 'Easy' : accuracy < 40 ? 'Hard' : 'Medium'
-      };
+      return { questionNumber: i + 1, questionText: q.questionText, correct, partial, wrong, accuracy };
     });
 
-    // Mask enrollment numbers in results
-    const maskedResults = allResults.map(r => ({
-      ...r.toObject(),
-      enrollmentNumber: maskEnrollment(r.enrollmentNumber)
+    // Step 2: Calculate Mean (μ) and Standard Deviation (σ)
+    const accuracies = questionData.map(q => q.accuracy);
+    const mean = accuracies.reduce((sum, acc) => sum + acc, 0) / accuracies.length;
+    const variance = accuracies.reduce((sum, acc) => sum + Math.pow(acc - mean, 2), 0) / accuracies.length;
+    const stdDev = Math.sqrt(variance);
+
+    // Step 3: Classify using Normal Distribution Zones
+    // Easy: x ≥ μ (top 50%), Medium: μ - σ ≤ x < μ (~34.1%), Hard: x < μ - σ (bottom ~15.9%)
+    const questionDifficulty = questionData.map(q => ({
+      ...q,
+      accuracy: Math.round(q.accuracy * 100) / 100,
+      difficulty: q.accuracy >= mean ? 'Easy' : q.accuracy >= (mean - stdDev) ? 'Medium' : 'Hard'
     }));
+
+    // Sort results by percentage (descending) for proper ranking
+    allResults.sort((a, b) => b.percentage - a.percentage);
 
     res.status(200).json({
       success: true,
@@ -1009,7 +1065,13 @@ export const evaluatePaper = async (req, res) => {
       totalMarks: paper.totalMarks,
       classStats,
       questionDifficulty,
-      results: maskedResults
+      results: allResults,
+      analytics: {
+        averageScore: Number(classStats.averagePercentage),
+        highestScore: classStats.highestScore,
+        lowestScore: classStats.lowestScore,
+        passRate: Number(classStats.passRate)
+      }
     });
   } catch (error) {
     console.error("Evaluation error:", error);
@@ -1018,7 +1080,7 @@ export const evaluatePaper = async (req, res) => {
 };
 
 
-// Helper function to update question difficulty in QuestionBank
+// Helper function to update question difficulty in QuestionBank using μ/σ-based zones
 async function updateQuestionDifficulty(subjectId, answerKey, allResults) {
   try {
     const questionBank = await QuestionBank.findOne({ subject: subjectId });
@@ -1030,68 +1092,70 @@ async function updateQuestionDifficulty(subjectId, answerKey, allResults) {
     const totalStudents = allResults.length;
     if (totalStudents === 0) return;
 
-    // Calculate stats for each question
+    // Step 1: Collect accuracy data for all questions
+    const questionData = [];
+
     for (let i = 0; i < answerKey.length; i++) {
       const keyQuestion = answerKey[i];
       const normalizedKeyText = normalizeText(keyQuestion.questionText);
 
-      // Find matching question in question bank
       const bankQuestionIndex = questionBank.questions.findIndex(
         q => normalizeText(q.questionText) === normalizedKeyText
       );
 
       if (bankQuestionIndex === -1) continue;
 
-      // Calculate performance for this question
-      let correctCount = 0;
-      let partialCount = 0;
-      let wrongCount = 0;
-      let totalScore = 0;
+      let correctCount = 0, partialCount = 0, wrongCount = 0, totalScore = 0;
 
       allResults.forEach(result => {
         if (result.questionStats && result.questionStats[i]) {
           const stat = result.questionStats[i];
-          if (stat.isFullMarks) {
-            correctCount++;
-          } else if (stat.isPartial || (stat.obtained > 0 && stat.obtained < stat.marks)) {
-            partialCount++;
-          } else {
-            wrongCount++;
-          }
+          if (stat.isFullMarks) correctCount++;
+          else if (stat.isPartial || (stat.obtained > 0 && stat.obtained < stat.marks)) partialCount++;
+          else wrongCount++;
           totalScore += stat.obtained || 0;
         }
       });
 
-      // Calculate accuracy (percentage of students who got it fully correct)
       const accuracy = (correctCount / totalStudents) * 100;
       const avgScore = totalScore / totalStudents;
 
-      // Determine difficulty based on accuracy
-      // Easy: >= 70% got it right
-      // Medium: 40-70% got it right
-      // Hard: < 40% got it right
-      let difficulty = 'Medium';
-      if (accuracy >= 70) {
-        difficulty = 'Easy';
-      } else if (accuracy < 40) {
-        difficulty = 'Hard';
-      }
+      questionData.push({ bankQuestionIndex, accuracy, avgScore, correctCount, partialCount, wrongCount });
+    }
 
-      // Update the question in question bank
-      questionBank.questions[bankQuestionIndex].difficulty = difficulty;
-      questionBank.questions[bankQuestionIndex].difficultyStats = {
+    if (questionData.length === 0) return;
+
+    // Step 2: Calculate Mean (μ) and Standard Deviation (σ)
+    const accuracies = questionData.map(q => q.accuracy);
+    const mean = accuracies.reduce((sum, acc) => sum + acc, 0) / accuracies.length;
+    const variance = accuracies.reduce((sum, acc) => sum + Math.pow(acc - mean, 2), 0) / accuracies.length;
+    const stdDev = Math.sqrt(variance);
+
+    // Step 3: Classify using Normal Distribution Zones
+    // Easy: x ≥ μ (top 50%), Medium: μ - σ ≤ x < μ (~34.1%), Hard: x < μ - σ (bottom ~15.9%)
+    for (const qData of questionData) {
+      let difficulty;
+      if (qData.accuracy >= mean) difficulty = 'Easy';
+      else if (qData.accuracy >= (mean - stdDev)) difficulty = 'Medium';
+      else difficulty = 'Hard';
+
+      questionBank.questions[qData.bankQuestionIndex].difficulty = difficulty;
+      questionBank.questions[qData.bankQuestionIndex].difficultyStats = {
         totalAttempts: totalStudents,
-        correctCount,
-        partialCount,
-        wrongCount,
-        accuracy: Math.round(accuracy * 100) / 100,
-        avgScore: Math.round(avgScore * 100) / 100,
+        correctCount: qData.correctCount,
+        partialCount: qData.partialCount,
+        wrongCount: qData.wrongCount,
+        accuracy: Math.round(qData.accuracy * 100) / 100,
+        avgScore: Math.round(qData.avgScore * 100) / 100,
+        mean: Math.round(mean * 100) / 100,
+        stdDev: Math.round(stdDev * 100) / 100,
         lastAnalyzedAt: new Date()
       };
     }
 
+    questionBank.markModified('questions');
     await questionBank.save();
-    console.log(`✅ Updated difficulty for ${answerKey.length} questions in QuestionBank`);
+    console.log(`✅ Updated difficulty for ${questionData.length} questions (μ=${mean.toFixed(1)}%, σ=${stdDev.toFixed(1)}%)`);
   } catch (error) {
     console.error("Error updating question difficulty:", error);
   }
@@ -1131,54 +1195,52 @@ export const getPaperResults = async (req, res) => {
       passRate: Number(((results.filter(r => r.percentage >= 40).length / results.length) * 100).toFixed(2))
     };
 
-    // Calculate question difficulty from results
+    // Calculate question difficulty from results using μ/σ-based zones
     const answerKey = paper.key?.questions || [];
-    const questionDifficulty = answerKey.map((q, i) => {
+
+    // Step 1: Collect accuracy data for all questions
+    const questionData = answerKey.map((q, i) => {
       let correct = 0, partial = 0, wrong = 0;
 
       results.forEach(r => {
         if (r.questionStats && r.questionStats[i]) {
           const stat = r.questionStats[i];
-          if (stat.isFullMarks) {
-            correct++;
-          } else if (stat.isPartial || (stat.obtained > 0 && stat.obtained < stat.marks)) {
-            partial++;
-          } else {
-            wrong++;
-          }
+          if (stat.isFullMarks) correct++;
+          else if (stat.isPartial || (stat.obtained > 0 && stat.obtained < stat.marks)) partial++;
+          else wrong++;
         }
       });
 
       const accuracy = results.length > 0 ? Math.round((correct / results.length) * 10000) / 100 : 0;
-
-      let difficulty = 'Medium';
-      if (accuracy >= 70) difficulty = 'Easy';
-      else if (accuracy < 40) difficulty = 'Hard';
-
-      return {
-        questionNumber: i + 1,
-        questionText: q.questionText || `Question ${i + 1}`,
-        correct,
-        partial,
-        wrong,
-        accuracy,
-        difficulty
-      };
+      return { questionNumber: i + 1, questionText: q.questionText || `Question ${i + 1}`, correct, partial, wrong, accuracy };
     });
 
-    // Mask enrollment numbers in results
-    const maskedResults = results.map(r => ({
-      ...r.toObject(),
-      enrollmentNumber: maskEnrollment(r.enrollmentNumber)
+    // Step 2: Calculate Mean (μ) and Standard Deviation (σ)
+    const accuracies = questionData.map(q => q.accuracy);
+    const mean = accuracies.length > 0 ? accuracies.reduce((sum, acc) => sum + acc, 0) / accuracies.length : 0;
+    const variance = accuracies.length > 0 ? accuracies.reduce((sum, acc) => sum + Math.pow(acc - mean, 2), 0) / accuracies.length : 0;
+    const stdDev = Math.sqrt(variance);
+
+    // Step 3: Classify using Normal Distribution Zones
+    // Easy: x ≥ μ (top 50%), Medium: μ - σ ≤ x < μ (~34.1%), Hard: x < μ - σ (bottom ~15.9%)
+    const questionDifficulty = questionData.map(q => ({
+      ...q,
+      difficulty: q.accuracy >= mean ? 'Easy' : q.accuracy >= (mean - stdDev) ? 'Medium' : 'Hard'
     }));
 
     res.status(200).json({
       success: true,
-      results: maskedResults,
+      results,
       classStats,
       questionDifficulty,
       paperName: paper.paperName,
-      subjectName: paper.subject?.name || ''
+      subjectName: paper.subject?.name || '',
+      analytics: {
+        averageScore: classStats.averageScore,
+        highestScore: classStats.highestScore,
+        lowestScore: classStats.lowestScore,
+        passRate: classStats.passRate
+      }
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -1302,8 +1364,9 @@ export const getPaperDifficultyAnalysis = async (req, res) => {
     const paper = await Paper.findById(paperId);
     const totalQuestions = paper.key?.questions?.length || 0;
 
-    // Calculate question-wise stats
-    const questionAnalysis = [];
+    // Calculate question-wise stats using μ/σ-based zones
+    // Step 1: Collect accuracy data for all questions
+    const questionData = [];
 
     for (let i = 0; i < totalQuestions; i++) {
       let correctCount = 0;
@@ -1316,23 +1379,32 @@ export const getPaperDifficultyAnalysis = async (req, res) => {
       });
 
       const accuracy = totalAttempts > 0 ? (correctCount / totalAttempts) * 100 : 0;
-      let difficulty = "Medium";
-      if (accuracy >= 80) difficulty = "Easy";
-      else if (accuracy < 50) difficulty = "Hard";
-
-      questionAnalysis.push({
+      questionData.push({
         questionNumber: i + 1,
         questionText: paper.key.questions[i]?.questionText || "",
         totalAttempts,
         correctCount,
         wrongCount: totalAttempts - correctCount,
-        accuracy: accuracy.toFixed(2),
-        difficulty
+        accuracy
       });
     }
 
+    // Step 2: Calculate Mean (μ) and Standard Deviation (σ)
+    const accuracies = questionData.map(q => q.accuracy);
+    const mean = accuracies.length > 0 ? accuracies.reduce((sum, acc) => sum + acc, 0) / accuracies.length : 0;
+    const variance = accuracies.length > 0 ? accuracies.reduce((sum, acc) => sum + Math.pow(acc - mean, 2), 0) / accuracies.length : 0;
+    const stdDev = Math.sqrt(variance);
+
+    // Step 3: Classify using Normal Distribution Zones
+    // Easy: x ≥ μ (top 50%), Medium: μ - σ ≤ x < μ (~34.1%), Hard: x < μ - σ (bottom ~15.9%)
+    const questionAnalysis = questionData.map(q => ({
+      ...q,
+      accuracy: q.accuracy.toFixed(2),
+      difficulty: q.accuracy >= mean ? "Easy" : q.accuracy >= (mean - stdDev) ? "Medium" : "Hard"
+    }));
+
     // Calculate overall stats
-    const avgAccuracy = questionAnalysis.reduce((sum, q) => sum + parseFloat(q.accuracy), 0) / totalQuestions;
+    const avgAccuracy = questionData.reduce((sum, q) => sum + q.accuracy, 0) / totalQuestions;
     const easyCount = questionAnalysis.filter(q => q.difficulty === "Easy").length;
     const mediumCount = questionAnalysis.filter(q => q.difficulty === "Medium").length;
     const hardCount = questionAnalysis.filter(q => q.difficulty === "Hard").length;
@@ -1350,6 +1422,32 @@ export const getPaperDifficultyAnalysis = async (req, res) => {
         },
         questions: questionAnalysis
       }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Delete all questions from a subject's question bank
+export const deleteAllQuestions = async (req, res) => {
+  try {
+    const { subjectId } = req.params;
+
+    const questionBank = await QuestionBank.findOne({ subject: subjectId });
+    if (!questionBank) {
+      return res.status(404).json({ success: false, message: "Question bank not found" });
+    }
+
+    const deletedCount = questionBank.questions.length;
+    questionBank.questions = [];
+    await questionBank.save();
+
+    // Update subject's total questions count
+    await Subject.findByIdAndUpdate(subjectId, { totalQuestions: 0 });
+
+    res.status(200).json({
+      success: true,
+      message: `Deleted all ${deletedCount} questions from question bank`
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

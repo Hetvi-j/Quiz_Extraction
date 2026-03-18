@@ -306,3 +306,43 @@ export const clearQuestionBank = async (req, res) => {
     res.status(500).json({ error: "Failed to clear question bank" });
   }
 };
+
+// Delete a specific question from the question bank
+export const deleteQuestion = async (req, res) => {
+  try {
+    const { subject, questionId } = req.params;
+
+    if (!subject || !questionId) {
+      return res.status(400).json({ error: "Subject and questionId are required" });
+    }
+
+    const bank = await QuestionBank.findOne({
+      subjectName: subject.toUpperCase()
+    });
+
+    if (!bank) {
+      return res.status(404).json({ error: "Question bank not found" });
+    }
+
+    // Find and remove the question
+    const questionIndex = bank.questions.findIndex(
+      q => q._id.toString() === questionId
+    );
+
+    if (questionIndex === -1) {
+      return res.status(404).json({ error: "Question not found" });
+    }
+
+    const deletedQuestion = bank.questions.splice(questionIndex, 1)[0];
+    await bank.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Question deleted successfully",
+      deletedQuestion: deletedQuestion.questionText.substring(0, 50) + "..."
+    });
+  } catch (error) {
+    console.error("Error deleting question:", error);
+    res.status(500).json({ error: "Failed to delete question" });
+  }
+};

@@ -14,6 +14,7 @@ import questionBankRoutes from "./routes/questionBankRoutes.js";
 import subjectUploadRoutes from "./routes/subjectUploadRoutes.js";
 import paperRoutes from "./routes/paperRoutes.js";
 import freeOcrRoutes from "./routes/freeOcrRoutes.js";
+import statsRoutes from "./routes/statsRoutes.js";
 dotenv.config();
 
 const app = express();
@@ -52,6 +53,7 @@ app.use("/api/v1/question-bank", questionBankRoutes);
 app.use("/api/v1/subject-upload", subjectUploadRoutes);
 app.use("/api/v1/papers", paperRoutes);
 app.use("/api/v1/free-ocr", freeOcrRoutes);
+app.use("/api/v1/stats", statsRoutes);
 
 
 

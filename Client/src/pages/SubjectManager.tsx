@@ -48,14 +48,11 @@ import {
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import AnalysisBarGraph from './AnalysisBarGraph';
 import AnalysisPieChart from './AnalysisPieChart';
-import QuestionDisplay, { QuestionTypeSummary } from '@/components/QuestionDisplay';
-import EvalResultDisplay from '@/components/EvalResultDisplay';
 
 // V1 API
 const API_BASE_URL = "http://localhost:8080/api/v1/papers";
 const QUESTION_BANK_URL = "http://localhost:8080/api/v1/question-bank";
 const FREE_OCR_URL = "http://localhost:8080/api/v1/free-ocr";
-const LLM_EVALUATOR_URL = "http://localhost:8002";
 
 interface Subject {
   _id: string;
@@ -81,6 +78,7 @@ interface Quiz {
 }
 
 interface Result {
+  _id: string;
   enrollmentNumber: string;
   obtainedMarks: number;
   totalMarks?: number;
@@ -225,18 +223,14 @@ const SubjectManager = () => {
   // View states
   const [expandedResult, setExpandedResult] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState('quizzes');
+  const [visibleResultsCount, setVisibleResultsCount] = useState(5); // Pagination for student results
 
   // Question Bank states
   const [questionBank, setQuestionBank] = useState<QuestionBank | null>(null);
   const [isLoadingQuestionBank, setIsLoadingQuestionBank] = useState(false);
   const [questionBankSearch, setQuestionBankSearch] = useState('');
-  const [questionBankFilter, setQuestionBankFilter] = useState<'all' | 'MCQ' | 'SHORT' | 'LONG' | 'TRUE_FALSE' | 'FILL_BLANK'>('all');
+  const [questionBankFilter, setQuestionBankFilter] = useState<'all' | 'MCQ' | 'SHORT' | 'LONG' | 'TRUE_FALSE'>('all');
   const [questionBankDifficultyFilter, setQuestionBankDifficultyFilter] = useState<'all' | 'Easy' | 'Medium' | 'Hard'>('all');
-
-  // LLM evaluation state
-  const [llmEvalResults, setLlmEvalResults] = useState<Record<string, any>>({});
-  const [isLlmEvaluating, setIsLlmEvaluating] = useState(false);
-  const [evalMode, setEvalMode] = useState<'standard' | 'llm'>('llm');
 
   const keyFileRef = useRef<HTMLInputElement>(null);
   const studentFileRef = useRef<HTMLInputElement>(null);
@@ -256,6 +250,7 @@ const SubjectManager = () => {
   // Fetch results when quiz changes
   useEffect(() => {
     if (selectedSubject && selectedQuiz?._id) {
+      setVisibleResultsCount(5); // Reset pagination when quiz changes
       if (!quizAnalyticsMap[selectedQuiz._id]?.results?.length) {
         fetchQuizResults(selectedSubject._id, selectedQuiz._id);
       }
@@ -295,8 +290,7 @@ const SubjectManager = () => {
   const fetchQuizDetails = async (subjectId: string, quizId: string) => {
     try {
       const response = await axios.get(`${API_BASE_URL}/papers/${quizId}`, getAuthHeaders());
-      // Always replace selected quiz with fresh server copy
-      setSelectedQuiz(response.data.paper);
+      setSelectedQuiz(prev => prev?._id === quizId ? response.data.paper : prev);
     } catch (error) {
       console.error("Error fetching quiz details:", error);
     }
@@ -333,6 +327,31 @@ const SubjectManager = () => {
       setQuestionBank(null);
     } finally {
       setIsLoadingQuestionBank(false);
+    }
+  };
+
+  const handleDeleteQuestion = async (questionId: string) => {
+    if (!selectedSubject || !questionBank) return;
+    if (!confirm('Are you sure you want to delete this question?')) return;
+
+    try {
+      const response = await axios.delete(
+        `${QUESTION_BANK_URL}/${encodeURIComponent(selectedSubject.name)}/question/${questionId}`,
+        getAuthHeaders()
+      );
+
+      if (response.data.success) {
+        // Update local state to remove the question
+        setQuestionBank({
+          ...questionBank,
+          questions: questionBank.questions.filter(q => q._id !== questionId),
+          totalQuestions: questionBank.totalQuestions - 1
+        });
+        setUploadStatus({ type: 'success', text: 'Question deleted successfully' });
+      }
+    } catch (error) {
+      console.error("Error deleting question:", error);
+      setUploadStatus({ type: 'error', text: 'Failed to delete question' });
     }
   };
 
@@ -477,7 +496,9 @@ const SubjectManager = () => {
 
       // For Groq: Save extracted data to paper
       if (extractedData?.success) {
-        setUploadStatus({ type: 'info', text: 'Saving answer key...' });
+        console.log('📋 Extracted questions:', extractedData.questions?.length);
+        console.log('📋 Questions:', extractedData.questions);
+        setUploadStatus({ type: 'info', text: `Saving ${extractedData.questions?.length || 0} questions...` });
 
         const saveResponse = await axios.post(
           `${API_BASE_URL}/papers/${selectedQuiz._id}/key-data`,
@@ -593,34 +614,80 @@ const SubjectManager = () => {
 
   // ==================== EVALUATE ====================
 
+  // Check if quiz has subjective questions (SHORT or LONG)
+  const hasSubjectiveQuestions = (quiz: Quiz | null): boolean => {
+    if (!quiz?.key?.questions) return false;
+    return quiz.key.questions.some(
+      (q: any) => q.questionType === 'SHORT' || q.questionType === 'LONG'
+    );
+  };
+
   const handleEvaluate = async () => {
     if (!selectedSubject || !selectedQuiz) return;
 
     try {
       setIsEvaluating(true);
-      setUploadStatus({ type: 'info', text: 'Evaluating...' });
 
-      const response = await axios.post(
-        `${API_BASE_URL}/papers/${selectedQuiz._id}/evaluate`,
-        {},
-        getAuthHeaders()
-      );
+      // Check if paper has subjective questions
+      const isSubjective = hasSubjectiveQuestions(selectedQuiz);
 
-      if (response.data.success) {
-        setUploadStatus({ type: 'success', text: `Evaluated ${response.data.results.length} students!` });
+      if (isSubjective) {
+        setUploadStatus({ type: 'info', text: 'Evaluating with AI (subjective questions detected)...' });
 
-        // Store in analytics map
-        setQuizAnalyticsMap(prev => ({
-          ...prev,
-          [selectedQuiz._id]: {
-            results: response.data.results,
-            analytics: response.data.analytics,
-            paperName: response.data.paperName,
-            subjectName: response.data.subjectName
-          }
-        }));
+        // Use the new subjective evaluation endpoint
+        const response = await axios.post(
+          `${FREE_OCR_URL}/evaluate-paper/${selectedQuiz._id}`,
+          {},
+          getAuthHeaders()
+        );
 
-        setActiveTab('analytics');
+        if (response.data.success) {
+          setUploadStatus({ type: 'success', text: `Evaluated ${response.data.results.length} students with AI!` });
+
+          // Store in analytics map
+          setQuizAnalyticsMap(prev => ({
+            ...prev,
+            [selectedQuiz._id]: {
+              results: response.data.results,
+              analytics: {
+                averageScore: Number(response.data.classStats.averagePercentage),
+                highestScore: response.data.classStats.highestScore,
+                lowestScore: response.data.classStats.lowestScore,
+                passRate: Number(response.data.classStats.passRate)
+              },
+              paperName: response.data.paperName,
+              subjectName: response.data.subjectName
+            }
+          }));
+
+          setActiveTab('analytics');
+        }
+      } else {
+        setUploadStatus({ type: 'info', text: 'Evaluating...' });
+
+        // Use the standard MCQ evaluation endpoint
+        const response = await axios.post(
+          `${API_BASE_URL}/papers/${selectedQuiz._id}/evaluate`,
+          {},
+          getAuthHeaders()
+        );
+
+        if (response.data.success) {
+          setUploadStatus({ type: 'success', text: `Evaluated ${response.data.results.length} students!` });
+
+          // Store in analytics map
+          setQuizAnalyticsMap(prev => ({
+            ...prev,
+            [selectedQuiz._id]: {
+              results: response.data.results,
+              analytics: response.data.analytics,
+              paperName: response.data.paperName,
+              subjectName: response.data.subjectName
+            }
+          }));
+
+          setActiveTab('analytics');
+        }
       }
     } catch (error: any) {
       setUploadStatus({ type: 'error', text: error.response?.data?.message || 'Evaluation failed' });
@@ -629,136 +696,57 @@ const SubjectManager = () => {
     }
   };
 
-  // LLM-enhanced evaluation for mixed objective + subjective papers
-  const handleLlmEvaluate = async () => {
-    if (!selectedSubject || !selectedQuiz) return;
-    if (!selectedQuiz.key?.questions || selectedQuiz.key.questions.length === 0) {
-      setUploadStatus({ type: 'error', text: 'No answer key uploaded. Upload an answer key first.' });
-      return;
-    }
+  // ==================== DELETE STUDENT RESULT ====================
 
-    const studentResponses = selectedQuiz.studentResponses || [];
-    if (studentResponses.length === 0) {
-      setUploadStatus({ type: 'error', text: 'No student responses uploaded.' });
-      return;
-    }
+  const handleDeleteStudentResult = async (resultId: string, enrollmentNumber: string) => {
+    if (!selectedSubject || !selectedQuiz) return;
+    if (!confirm(`Delete result for student ${enrollmentNumber}?`)) return;
 
     try {
-      setIsLlmEvaluating(true);
-      const keyQuestions = selectedQuiz.key.questions;
-
-      // Check if there are any subjective questions
-      const hasSubjective = keyQuestions.some((q: any) =>
-        ['SHORT', 'LONG'].includes((q.questionType || 'MCQ').toUpperCase())
+      const response = await axios.delete(
+        `${API_BASE_URL}/papers/${selectedQuiz._id}/results/${resultId}`,
+        getAuthHeaders()
       );
 
-      setUploadStatus({
-        type: 'info',
-        text: hasSubjective
-          ? `Evaluating ${studentResponses.length} student(s) with LLM for subjective answers...`
-          : `Evaluating ${studentResponses.length} student(s)...`
-      });
+      if (response.data.success) {
+        // Remove from local analytics map
+        setQuizAnalyticsMap(prev => {
+          const currentQuizAnalytics = prev[selectedQuiz._id];
+          if (!currentQuizAnalytics) return prev;
 
-      const allResults: Record<string, any> = {};
-
-      for (let si = 0; si < studentResponses.length; si++) {
-        const student = studentResponses[si];
-        const enrollment = student.enrollmentNumber || `Student_${si + 1}`;
-        const studentAnswers = student.questions || [];
-
-        setUploadStatus({
-          type: 'info',
-          text: `Evaluating student ${si + 1}/${studentResponses.length} (${enrollment})...`
-        });
-
-        // Build question-answer pairs for the evaluator
-        const evalQuestions = keyQuestions.map((keyQ: any, idx: number) => {
-          const studentAns = studentAnswers[idx];
-          return {
-            questionText: keyQ.questionText || `Question ${idx + 1}`,
-            questionType: keyQ.questionType || 'MCQ',
-            marks: keyQ.marks || 1,
-            correctAnswer: keyQ.Answer || keyQ.answer || keyQ.correctAnswer || '',
-            studentAnswer: studentAns?.answer || '',
-          };
-        });
-
-        try {
-          // Call LLM evaluator for this student
-          const evalResponse = await axios.post(
-            `${LLM_EVALUATOR_URL}/evaluate/bulk`,
-            { questions: evalQuestions },
-            { timeout: 180000 }
+          const updatedResults = currentQuizAnalytics.results.filter(
+            r => r._id !== resultId
           );
 
-          if (evalResponse.data.success) {
-            allResults[enrollment] = {
-              results: evalResponse.data.results,
-              summary: evalResponse.data.summary,
-              enrollment,
-            };
-          }
-        } catch (err: any) {
-          console.error(`LLM eval failed for ${enrollment}:`, err);
-          allResults[enrollment] = {
-            results: [],
-            summary: null,
-            enrollment,
-            error: err.message,
-          };
-        }
-      }
+          // Recalculate analytics
+          const newAnalytics = updatedResults.length > 0 ? {
+            averageScore: Number((updatedResults.reduce((sum, r) => sum + r.percentage, 0) / updatedResults.length).toFixed(2)),
+            highestScore: Math.max(...updatedResults.map(r => r.percentage)),
+            lowestScore: Math.min(...updatedResults.map(r => r.percentage)),
+            passRate: Number(((updatedResults.filter(r => r.percentage >= 40).length / updatedResults.length) * 100).toFixed(2))
+          } : null;
 
-      setLlmEvalResults(prev => ({
-        ...prev,
-        [selectedQuiz._id]: allResults
-      }));
-
-      // Also save to the standard analytics pipeline
-      try {
-        const standardResponse = await axios.post(
-          `${API_BASE_URL}/papers/${selectedQuiz._id}/evaluate`,
-          {},
-          getAuthHeaders()
-        );
-
-        if (standardResponse.data.success) {
-          setQuizAnalyticsMap(prev => ({
+          return {
             ...prev,
             [selectedQuiz._id]: {
-              results: standardResponse.data.results,
-              analytics: standardResponse.data.analytics,
-              paperName: standardResponse.data.paperName,
-              subjectName: standardResponse.data.subjectName
+              ...currentQuizAnalytics,
+              results: updatedResults,
+              analytics: newAnalytics
             }
-          }));
-        }
-      } catch {
-        // Standard evaluation is secondary, LLM results are primary
-      }
+          };
+        });
 
-      const totalStudents = Object.keys(allResults).length;
-      const successStudents = Object.values(allResults).filter((r: any) => !r.error).length;
-      setUploadStatus({
-        type: 'success',
-        text: `LLM evaluation complete! ${successStudents}/${totalStudents} students evaluated successfully.`
-      });
-      setActiveTab('analytics');
+        // Refresh quiz details
+        fetchQuizzes(selectedSubject._id);
+        fetchQuizDetails(selectedSubject._id, selectedQuiz._id);
+        setUploadStatus({ type: 'success', text: `Deleted student ${enrollmentNumber}` });
+      }
     } catch (error: any) {
-      setUploadStatus({ type: 'error', text: error.message || 'LLM evaluation failed' });
-    } finally {
-      setIsLlmEvaluating(false);
+      setUploadStatus({ type: 'error', text: error.response?.data?.message || 'Failed to delete student' });
     }
   };
 
   // ==================== HELPERS ====================
-
-  const maskEnrollment = (enrollment: string) => {
-    if (enrollment.length > 5) {
-      return enrollment.slice(0, -5) + '*****';
-    }
-    return enrollment;
-  };
 
   // Calculate question-wise analysis from results using class mean for difficulty
   const calculateQuestionAnalysis = (): {
@@ -784,14 +772,10 @@ const SubjectManager = () => {
         const studentAnswers = result.questionStats || result.answers || [];
         const answer = studentAnswers[idx];
         if (answer) {
-          const maxMarks = answer.marks || q.marks || 1;
-          const obtained = answer.obtained ?? answer.marksObtained ?? 0;
-          const isFullCorrect = answer.isCorrect || answer.isFullMarks || obtained === maxMarks;
-          const isPartial = answer.isPartial || (!isFullCorrect && obtained > 0);
-
-          if (isFullCorrect) {
+          // Use backend flags directly: isFullMarks for correct, isPartial for partial
+          if (answer.isFullMarks) {
             correctCount++;
-          } else if (isPartial) {
+          } else if (answer.isPartial) {
             partialCount++;
           } else {
             wrongCount++;
@@ -1014,7 +998,7 @@ const SubjectManager = () => {
                             {subject.code && <Badge variant="outline" className="text-xs">{subject.code}</Badge>}
                           </h3>
                           <p className="text-sm text-gray-500">
-                            {subject.totalPapers || 0} papers • {subject.totalQuestions || 0} questions
+                            {subject.totalPapers || 0} papers 
                           </p>
                         </div>
                         <Button
@@ -1226,12 +1210,9 @@ const SubjectManager = () => {
                             Answer Key
                           </h4>
                           {selectedQuiz.key?.uploadedAt ? (
-                            <div className="space-y-2">
-                              <div className="text-sm text-green-700">
-                                <CheckCircle className="h-4 w-4 inline mr-1" />
-                                Key uploaded ({selectedQuiz.key?.questions?.length || 0} questions, {selectedQuiz.totalMarks} marks)
-                              </div>
-                              <QuestionTypeSummary questions={selectedQuiz.key.questions || []} />
+                            <div className="text-sm text-green-700">
+                              <CheckCircle className="h-4 w-4 inline mr-1" />
+                              Key uploaded ({selectedQuiz.key?.questions?.length || 0} questions, {selectedQuiz.totalMarks} marks)
                             </div>
                           ) : (
                             <div className="space-y-3">
@@ -1305,51 +1286,20 @@ const SubjectManager = () => {
                           </div>
                         </div>
 
-                        {/* Question Type Summary */}
-                        {selectedQuiz.key?.questions?.length > 0 && (
-                          <div className="p-4 border rounded-lg bg-gray-50 border-gray-200">
-                            <h4 className="font-semibold text-sm mb-2">Extracted Question Types</h4>
-                            <QuestionTypeSummary questions={selectedQuiz.key.questions} />
-                            {selectedQuiz.key.questions.some((q: any) => ['SHORT', 'LONG'].includes(q.questionType)) && (
-                              <p className="text-xs text-indigo-600 mt-2">
-                                This paper contains subjective questions -- use LLM Evaluate for AI-powered grading.
-                              </p>
-                            )}
-                          </div>
-                        )}
-
-                        {/* Evaluate Buttons */}
+                        {/* Evaluate Button */}
                         {selectedQuiz.key?.questions?.length > 0 && (selectedQuiz.studentResponses?.length || 0) > 0 && (
-                          <div className="space-y-2">
-                            {/* LLM Evaluate (for papers with subjective questions) */}
-                            <Button
-                              onClick={handleLlmEvaluate}
-                              disabled={isLlmEvaluating || isEvaluating}
-                              className="w-full bg-indigo-600 hover:bg-indigo-700"
-                            >
-                              {isLlmEvaluating ? (
-                                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                              ) : (
-                                <Sparkles className="h-4 w-4 mr-2" />
-                              )}
-                              {isLlmEvaluating ? 'AI Evaluating...' : 'LLM Evaluate (Objective + Subjective)'}
-                            </Button>
-
-                            {/* Standard Evaluate (exact match only) */}
-                            <Button
-                              onClick={handleEvaluate}
-                              disabled={isEvaluating || isLlmEvaluating}
-                              variant="outline"
-                              className="w-full"
-                            >
-                              {isEvaluating ? (
-                                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                              ) : (
-                                <Play className="h-4 w-4 mr-2" />
-                              )}
-                              Standard Evaluate (Exact Match Only)
-                            </Button>
-                          </div>
+                          <Button
+                            onClick={handleEvaluate}
+                            disabled={isEvaluating}
+                            className="w-full bg-green-600 hover:bg-green-700"
+                          >
+                            {isEvaluating ? (
+                              <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                            ) : (
+                              <Play className="h-4 w-4 mr-2" />
+                            )}
+                            Evaluate All Students
+                          </Button>
                         )}
                       </CardContent>
                     </Card>
@@ -1401,6 +1351,15 @@ const SubjectManager = () => {
                           <p className="text-sm text-purple-600">Max Frequency</p>
                         </CardContent>
                       </Card>
+                        {/* <Card className="bg-blue-50 border-blue-200">
+                        <CardContent className="p-4 text-center">
+                          <FileText className="h-8 w-8 mx-auto mb-2 text-blue-600" />
+                          <p className="text-2xl font-bold text-blue-700">
+                            {questionBank.questions.filter(q => q.questionType === 'FILL_BLANK' || q.questionType === 'TRUE_FALSE').length}
+                          </p>
+                          <p className="text-sm text-blue-600">True/False and Fill in the Blanks</p>
+                        </CardContent>
+                      </Card> */}
                     </div>
 
                     {/* Search and Filter */}
@@ -1446,6 +1405,7 @@ const SubjectManager = () => {
                             >
                               Long
                             </Button>
+                            
 
                             {/* Divider */}
                             <div className="border-l border-gray-300 mx-1"></div>
@@ -1551,6 +1511,16 @@ const SubjectManager = () => {
                                     )}
                                   </div>
                                   <div className="flex flex-col gap-2 items-end">
+                                    {/* Delete Button */}
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="text-red-500 hover:text-red-700 hover:bg-red-50 h-7 w-7 p-0"
+                                      onClick={() => handleDeleteQuestion(question._id)}
+                                      title="Delete question"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
                                     {/* Difficulty Badge from Analytics */}
                                     {(() => {
                                       const difficulty = getQuestionDifficulty(question.questionText);
@@ -1602,49 +1572,6 @@ const SubjectManager = () => {
 
               {/* Analytics Tab */}
               <TabsContent value="analytics">
-                {/* LLM Evaluation Results */}
-                {selectedQuiz && llmEvalResults[selectedQuiz._id] && (
-                  <div className="space-y-6 mb-8">
-                    <Card>
-                      <CardHeader>
-                        <CardTitle className="flex items-center gap-2">
-                          <Sparkles className="h-5 w-5 text-indigo-600" />
-                          LLM Evaluation Results (AI-Graded)
-                        </CardTitle>
-                        <CardDescription>
-                          Subjective answers evaluated by AI, objective answers graded by exact matching
-                        </CardDescription>
-                      </CardHeader>
-                      <CardContent>
-                        <div className="space-y-6">
-                          {Object.entries(llmEvalResults[selectedQuiz._id] as Record<string, any>).map(([enrollment, data]: [string, any]) => (
-                            <div key={enrollment} className="border rounded-lg p-4">
-                              <h3 className="font-semibold text-lg mb-3 flex items-center gap-2">
-                                <GraduationCap className="h-5 w-5" />
-                                Student: {maskEnrollment(enrollment)}
-                                {data.error && (
-                                  <Badge className="bg-red-100 text-red-700">
-                                    <XCircle className="h-3 w-3 mr-1" />
-                                    Evaluation Error
-                                  </Badge>
-                                )}
-                              </h3>
-                              {data.error ? (
-                                <p className="text-sm text-red-600">Error: {data.error}</p>
-                              ) : (
-                                <EvalResultDisplay
-                                  results={data.results || []}
-                                  summary={data.summary}
-                                />
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      </CardContent>
-                    </Card>
-                  </div>
-                )}
-
                 {results.length > 0 ? (
                   <div className="space-y-6">
                     {/* Header Card with Stats */}
@@ -1769,6 +1696,7 @@ const SubjectManager = () => {
                                 <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">Question</th>
                                 <th className="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase">Attempts</th>
                                 <th className="px-3 py-3 text-center text-xs font-medium text-green-600 uppercase">Correct</th>
+                                <th className="px-3 py-3 text-center text-xs font-medium text-yellow-600 uppercase">Partial</th>
                                 <th className="px-3 py-3 text-center text-xs font-medium text-red-600 uppercase">Wrong</th>
                                 <th className="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase">Accuracy</th>
                                 <th className="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase">Difficulty</th>
@@ -1783,6 +1711,7 @@ const SubjectManager = () => {
                                   </td>
                                   <td className="px-3 py-3 text-sm text-center">{q.totalAttempts}</td>
                                   <td className="px-3 py-3 text-sm text-center font-medium text-green-600">{q.correctCount}</td>
+                                  <td className="px-3 py-3 text-sm text-center font-medium text-yellow-600">{q.partialCount}</td>
                                   <td className="px-3 py-3 text-sm text-center font-medium text-red-600">{q.wrongCount}</td>
                                   <td className="px-3 py-3 text-sm text-center font-medium">{q.accuracy.toFixed(1)}%</td>
                                   <td className="px-3 py-3 text-center">
@@ -1820,10 +1749,11 @@ const SubjectManager = () => {
                                 <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">%</th>
                                 <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">Grade</th>
                                 <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">Details</th>
+                                <th className="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase">Actions</th>
                               </tr>
                             </thead>
                             <tbody className="bg-white divide-y divide-gray-200">
-                              {results.map((result, rank) => {
+                              {results.slice(0, visibleResultsCount).map((result, rank) => {
                                 // Use summary from MongoDB if available, otherwise calculate
                                 const correctCount = result.summary?.fullCorrect ?? 0;
                                 const partialCount = result.summary?.partialCorrect ?? 0;
@@ -1838,7 +1768,7 @@ const SubjectManager = () => {
                                       {rank === 2 && <span className="text-orange-400 font-bold">🥉</span>}
                                       {rank > 2 && <span>{rank + 1}</span>}
                                     </td>
-                                    <td className="px-3 py-3 text-sm font-medium">{maskEnrollment(result.enrollmentNumber)}</td>
+                                    <td className="px-3 py-3 text-sm font-medium">{result.enrollmentNumber}</td>
                                     <td className="px-3 py-3 text-sm text-center font-medium text-green-600">{correctCount}</td>
                                     <td className="px-3 py-3 text-sm text-center font-medium text-yellow-600">{partialCount}</td>
                                     <td className="px-3 py-3 text-sm text-center font-medium text-red-600">{wrongCount}</td>
@@ -1872,13 +1802,24 @@ const SubjectManager = () => {
                                         )}
                                       </Button>
                                     </td>
+                                    <td className="px-3 py-3 text-center">
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="text-red-500 hover:text-red-700 hover:bg-red-50"
+                                        onClick={() => handleDeleteStudentResult(result._id, result.enrollmentNumber)}
+                                        title="Delete student result"
+                                      >
+                                        <Trash2 className="h-4 w-4" />
+                                      </Button>
+                                    </td>
                                   </tr>
                                   {expandedResult === rank && (
                                     <tr>
-                                      <td colSpan={9} className="p-0 bg-gray-50">
+                                      <td colSpan={10} className="p-0 bg-gray-50">
                                         <div className="p-4">
                                           <h4 className="text-sm font-semibold mb-3">
-                                            Question-wise Details for {maskEnrollment(result.enrollmentNumber)}
+                                            Question-wise Details for {result.enrollmentNumber}
                                           </h4>
 
                                           {(result.questionStats || result.answers) && (result.questionStats || result.answers).length > 0 ? (
@@ -1905,8 +1846,12 @@ const SubjectManager = () => {
                                                     const studentAns = ans.studentAnswer || ans.selected || '-';
                                                     const maxMarks = ans.marks || ans.maxMarks || quizQuestion.marks || 1;
                                                     const obtained = ans.obtained ?? ans.marksObtained ?? 0;
-                                                    const isCorrect = ans.isCorrect || ans.isFullMarks || obtained === maxMarks;
-                                                    const isPartial = ans.isPartial || (!isCorrect && obtained > 0);
+                                                    // Check for full marks first (isFullMarks flag or obtained equals max)
+                                                    const isFullCorrect = ans.isFullMarks || obtained === maxMarks;
+                                                    // Partial: got some marks but not full marks
+                                                    const isPartial = ans.isPartial || (!isFullCorrect && obtained > 0);
+                                                    // For display purposes, isCorrect means full marks
+                                                    const isCorrect = isFullCorrect;
 
                                                     return (
                                                       <tr
@@ -1963,27 +1908,53 @@ const SubjectManager = () => {
                             </tbody>
                           </table>
                         </div>
+
+                        {/* Pagination Buttons */}
+                        {results.length > 5 && (
+                          <div className="flex justify-center gap-4 mt-4">
+                            <p className="text-sm text-gray-500 self-center">
+                              Showing {Math.min(visibleResultsCount, results.length)} of {results.length} students
+                            </p>
+                            {visibleResultsCount < results.length && (
+                              <Button
+                                variant="outline"
+                                onClick={() => setVisibleResultsCount(prev => Math.min(prev + 5, results.length))}
+                              >
+                                Load More
+                              </Button>
+                            )}
+                            {visibleResultsCount < results.length && (
+                              <Button
+                                variant="default"
+                                className="bg-indigo-600 hover:bg-indigo-700"
+                                onClick={() => setVisibleResultsCount(results.length)}
+                              >
+                                Show All ({results.length})
+                              </Button>
+                            )}
+                            {visibleResultsCount > 5 && (
+                              <Button
+                                variant="outline"
+                                onClick={() => setVisibleResultsCount(5)}
+                              >
+                                Show Less
+                              </Button>
+                            )}
+                          </div>
+                        )}
                       </CardContent>
                     </Card>
                   </div>
                 ) : (
-                  <>
-                    {/* Show LLM results even if standard results are empty */}
-                    {!(selectedQuiz && llmEvalResults[selectedQuiz._id]) && (
-                      <Card>
-                        <CardContent className="py-16 text-center">
-                          <BarChart3 className="h-16 w-16 mx-auto mb-4 text-gray-300" />
-                          <h2 className="text-xl font-semibold text-gray-500">No Results Yet</h2>
-                          <p className="text-gray-400 mt-2">
-                            Upload answer key and student responses, then evaluate
-                          </p>
-                          <p className="text-indigo-500 text-sm mt-1">
-                            Use "LLM Evaluate" for AI-powered grading of subjective answers
-                          </p>
-                        </CardContent>
-                      </Card>
-                    )}
-                  </>
+                  <Card>
+                    <CardContent className="py-16 text-center">
+                      <BarChart3 className="h-16 w-16 mx-auto mb-4 text-gray-300" />
+                      <h2 className="text-xl font-semibold text-gray-500">No Results Yet</h2>
+                      <p className="text-gray-400 mt-2">
+                        Upload answer key and student responses, then evaluate
+                      </p>
+                    </CardContent>
+                  </Card>
                 )}
               </TabsContent>
             </Tabs>

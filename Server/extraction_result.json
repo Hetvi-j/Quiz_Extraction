@@ -1,0 +1,124 @@
+{
+  "success": true,
+  "extraction": {
+    "documentInfo": {
+      "enrollmentNumber": "RH0400011016",
+      "date": "04/09/2025",
+      "totalMarks": 15
+    },
+    "questions": [
+      {
+        "questionText": "Q1. Choose the right option. int* x, y;",
+        "questionType": "MCQ",
+        "marks": 0.5,
+        "options": [
+          "A) x is a pointer to a integer, y is a integer",
+          "B) y is a pointer to a integer, x is a integer",
+          "C) both x and y are pointers to integer types",
+          "D) y is a pointer to a integer"
+        ],
+        "Answer": "C"
+      },
+      {
+        "questionText": "Q2. What is the primary operation used to add an element to a stack?",
+        "questionType": "MCQ",
+        "marks": 0.5,
+        "options": [
+          "A) peek",
+          "B) Enqueue",
+          "C) Pop",
+          "D) Push"
+        ],
+        "Answer": "D"
+      },
+      {
+        "questionText": "Q3. What is the principle followed by a Stack data structure?",
+        "questionType": "MCQ",
+        "marks": 0.5,
+        "options": [
+          "A) FILO",
+          "B) LILD",
+          "C) LIFO",
+          "D) FIFO",
+          "E) Random Access"
+        ],
+        "Answer": "C"
+      },
+      {
+        "questionText": "Q4. What is the principle followed by a queue data structure?",
+        "questionType": "MCQ",
+        "marks": 0.5,
+        "options": [
+          "A) FILO",
+          "B) LILD",
+          "C) LIFO",
+          "D) FIFO",
+          "E) Random Access"
+        ],
+        "Answer": "D"
+      },
+      {
+        "questionText": "Q5. Which operation is used to remove an element from a queue?",
+        "questionType": "MCQ",
+        "marks": 0.5,
+        "options": [
+          "A) peek",
+          "B) Enqueue",
+          "C) Dequeue",
+          "D) Pop"
+        ],
+        "Answer": "C"
+      },
+      {
+        "questionText": "Q6. What happens if you try to pop an element from an empty stack?",
+        "questionType": "MCQ",
+        "marks": 0.5,
+        "options": [
+          "A) The program enters an infinite loop.",
+          "B) A 'Stack Underflow' error occurs.",
+          "C) The stack automatically resizes to prevent an error.",
+          "D) A 'Stack Overflow' error occurs."
+        ],
+        "Answer": "B"
+      },
+      {
+        "questionText": "Q7. Which of the following is/are linear Data Structures?",
+        "questionType": "MCQ",
+        "marks": 1,
+        "options": [
+          "A) Stack",
+          "B) Queue",
+          "C) Tree",
+          "D) Linkedlist",
+          "E) Array"
+        ],
+        "Answer": "A,B,D,E"
+      },
+      {
+        "questionText": "Q8. What is the output of the following program? #include <iostream> using namespace std; int main() { int arr[] = {4, 5, 6, 7}; int* p = (arr + 2); cout << *arr + 11; return 0; }",
+        "questionType": "MCQ",
+        "marks": 1,
+        "options": [
+          "A) 16",
+          "B) 15",
+          "C) 14",
+          "D) error"
+        ],
+        "Answer": "B"
+      },
+      {
+        "questionText": "Q9. What is the output of the following program? #include <iostream> using namespace std; int main() { char *ptr; char Str[] = \"abcdefg\"; ptr = Str; ptr += 5; cout << ptr; return 0; }",
+        "questionType": "MCQ",
+        "marks": 1,
+        "options": [
+          "A) cdef",
+          "B) fg",
+          "C) defg",
+          "D) abcd"
+        ],
+        "Answer": "C"
+      }
+    ]
+  },
+  "filename": "DocScanner 05-Nov-2025 9-10 am.pdf"
+}

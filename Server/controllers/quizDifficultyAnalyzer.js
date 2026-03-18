@@ -12,19 +12,40 @@ export const getQuizSummary = async (req, res) => {
       return res.status(404).json({ message: "No question data found" });
     }
 
-    const summary = questions.map(q => {
+    // ── STEP 1: Calculate accuracy for each question ────────────────────────
+    const questionsWithAccuracy = questions.map(q => {
       const accuracy = q.totalAttempts
         ? (q.correctCount / q.totalAttempts) * 100
         : 0;
+      return { ...q.toObject(), calculatedAccuracy: accuracy };
+    });
 
-      let difficulty = "Hard";
-      if (accuracy > 80) difficulty = "Easy";
-      else if (accuracy >= 50) difficulty = "Medium";
+    // ── STEP 2: Calculate Mean (μ) and Standard Deviation (σ) ───────────────
+    const accuracies = questionsWithAccuracy.map(q => q.calculatedAccuracy);
+    const mean = accuracies.reduce((sum, acc) => sum + acc, 0) / accuracies.length;
+
+    const squaredDiffs = accuracies.map(acc => Math.pow(acc - mean, 2));
+    const variance = squaredDiffs.reduce((sum, sq) => sum + sq, 0) / accuracies.length;
+    const stdDev = Math.sqrt(variance);
+
+    // ── STEP 3: Classify difficulty using Normal Distribution Zones ─────────
+    // Easy Zone:   x ≥ μ         (top 50% - above or equal to mean)
+    // Medium Zone: μ - σ ≤ x < μ (middle ~34.1% - between mean-1σ and mean)
+    // Hard Zone:   x < μ - σ     (bottom ~15.9% - below mean-1σ)
+    const summary = questionsWithAccuracy.map(q => {
+      let difficulty;
+      if (q.calculatedAccuracy >= mean) {
+        difficulty = "Easy";       // x ≥ μ (top 50%)
+      } else if (q.calculatedAccuracy >= (mean - stdDev)) {
+        difficulty = "Medium";     // μ - σ ≤ x < μ (~34.1%)
+      } else {
+        difficulty = "Hard";       // x < μ - σ (bottom ~15.9%)
+      }
 
       return {
         questionNumber: q.questionNumber,
         questionText: q.questionText,
-        accuracy: accuracy.toFixed(2) + "%",
+        accuracy: q.calculatedAccuracy.toFixed(2) + "%",
         difficulty
       };
     });
@@ -34,16 +55,24 @@ export const getQuizSummary = async (req, res) => {
     const totalAttempts = questions.reduce((sum, q) => sum + q.totalAttempts, 0);
     const overallAccuracy = totalAttempts ? (totalCorrect / totalAttempts) * 100 : 0;
 
-    let overallDifficulty = "Hard";
-    if (overallAccuracy > 80) overallDifficulty = "Easy";
-    else if (overallAccuracy >= 50) overallDifficulty = "Medium";
+    // Overall difficulty based on where overall accuracy falls
+    let overallDifficulty;
+    if (overallAccuracy >= mean) {
+      overallDifficulty = "Easy";
+    } else if (overallAccuracy >= (mean - stdDev)) {
+      overallDifficulty = "Medium";
+    } else {
+      overallDifficulty = "Hard";
+    }
 
     res.json({
       summary,
       overall: {
         totalQuestions: questions.length,
         overallAccuracy: overallAccuracy.toFixed(2) + "%",
-        overallDifficulty
+        overallDifficulty,
+        mean: mean.toFixed(2) + "%",
+        stdDev: stdDev.toFixed(2) + "%"
       }
     });
 
@@ -82,11 +111,18 @@ export const analyzeQuizPerformance = async (req, res) => {
     // Higher avgDifficultyIndex → harder quiz
     const QIS = (avgAccuracy * 0.6) + ((100 - stdDev * 2) * 0.3) + ((1 - avgDifficultyIndex) * 100 * 0.1);
 
-    // STEP 6: Derive difficulty level
-    let overallLevel = "Hard";
-    if (avgAccuracy > 80 && stdDev < 10) overallLevel = "Easy";
-    else if (avgAccuracy >= 50 && stdDev < 20) overallLevel = "Medium";
-    else if (avgAccuracy < 50) overallLevel = "Hard";
+    // STEP 6: Derive difficulty level using Normal Distribution Zones
+    // Easy Zone:   x ≥ μ         (top 50% - above or equal to mean)
+    // Medium Zone: μ - σ ≤ x < μ (middle ~34.1% - between mean-1σ and mean)
+    // Hard Zone:   x < μ - σ     (bottom ~15.9% - below mean-1σ)
+    let overallLevel;
+    if (avgAccuracy >= mean) {
+      overallLevel = "Easy";       // x ≥ μ (top 50%)
+    } else if (avgAccuracy >= (mean - stdDev)) {
+      overallLevel = "Medium";     // μ - σ ≤ x < μ (~34.1%)
+    } else {
+      overallLevel = "Hard";       // x < μ - σ (bottom ~15.9%)
+    }
 
     // STEP 7: Print internal calculations
     console.log("==== Quiz Performance Deep Analysis ====");

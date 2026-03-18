@@ -5,7 +5,8 @@ import {
   generateQuiz,
   addQuestions,
   migrateExistingQuizzes,
-  clearQuestionBank
+  clearQuestionBank,
+  deleteQuestion
 } from "../controllers/questionBankController.js";
 
 const router = express.Router();
@@ -27,5 +28,8 @@ router.post("/migrate", migrateExistingQuizzes);
 
 // POST /api/v1/question-bank/clear - Clear question bank for a subject
 router.post("/clear", clearQuestionBank);
+
+// DELETE /api/v1/question-bank/:subject/question/:questionId - Delete a specific question
+router.delete("/:subject/question/:questionId", deleteQuestion);
 
 export default router;

@@ -31,7 +31,6 @@ import {
   Zap
 } from "lucide-react";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import QuestionDisplay, { QuestionTypeSummary } from '@/components/QuestionDisplay';
 
 const API_BASE_URL = "http://localhost:8080/api/v1/subject-upload";
 
@@ -640,19 +639,17 @@ const SubjectUpload = () => {
                           {expandedUploadId === upload._id && (
                             <tr>
                               <td colSpan={5} className="p-4 bg-gray-50">
-                                <div className="mb-3">
-                                  <QuestionTypeSummary questions={upload.extractedData?.questions || []} />
-                                </div>
-                                <div className="space-y-2">
+                                <h4 className="font-semibold mb-2">Questions:</h4>
+                                <ul className="space-y-3">
                                   {upload.extractedData?.questions?.map((q, idx) => (
-                                    <QuestionDisplay
-                                      key={idx}
-                                      question={q}
-                                      index={idx}
-                                      showAnswer={true}
-                                    />
+                                    <li key={idx} className="text-sm">
+                                      <p className="font-medium">{idx + 1}. {q.questionText}</p>
+                                      <p className="ml-4 text-gray-600">
+                                        <span className="text-green-700 font-semibold">Answer:</span> {q.Answer || 'N/A'}
+                                      </p>
+                                    </li>
                                   ))}
-                                </div>
+                                </ul>
                               </td>
                             </tr>
                           )}

@@ -219,6 +219,35 @@ const QuestionBank = () => {
     }
   };
 
+  // Delete all questions for currently selected subject
+  const deleteAllQuestions = async () => {
+    if (!selectedSubject) return;
+
+    const subjectInfo = subjects.find(s => s.subject === selectedSubject);
+    if (!confirm(`Are you sure you want to DELETE ALL ${questions.length} questions from "${selectedSubject}" question bank?\n\nThis action cannot be undone!`)) {
+      return;
+    }
+
+    try {
+      // Get subject ID from the papers API
+      const subjectsResponse = await axios.get("http://localhost:8080/api/v1/papers/subjects");
+      const subjectData = subjectsResponse.data.subjects?.find((s: any) => s.name === selectedSubject);
+
+      if (!subjectData) {
+        alert("Subject not found in database");
+        return;
+      }
+
+      const response = await axios.delete(`http://localhost:8080/api/v1/papers/subjects/${subjectData._id}/question-bank`);
+      alert(response.data.message);
+      setQuestions([]);
+      fetchSubjects();
+    } catch (error) {
+      console.error("Error deleting questions:", error);
+      alert("Failed to delete questions.");
+    }
+  };
+
   return (
     <div className="container mx-auto p-6 space-y-6">
       <div className="flex justify-between items-center">
@@ -527,11 +556,25 @@ const QuestionBank = () => {
         <Card>
           <CardHeader>
             <div className="flex justify-between items-start">
-              <div>
-                <CardTitle>All Questions - {selectedSubject}</CardTitle>
-                <CardDescription className="mt-1">
-                  Showing {filteredQuestions.length} of {questions.length} questions
-                </CardDescription>
+              <div className="flex items-center gap-3">
+                <div>
+                  <CardTitle>All Questions - {selectedSubject}</CardTitle>
+                  <CardDescription className="mt-1">
+                    Showing {filteredQuestions.length} of {questions.length} questions
+                  </CardDescription>
+                </div>
+                {/* Delete All Button */}
+                {questions.length > 0 && (
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={deleteAllQuestions}
+                    title="Delete all questions from this subject"
+                  >
+                    <Trash2 className="h-4 w-4 mr-1" />
+                    Delete All
+                  </Button>
+                )}
               </div>
               {/* Difficulty Filter Buttons */}
               <div className="flex gap-2">

@@ -4,7 +4,9 @@ import {
   healthCheck,
   extractFromFile,
   extractAnswerKey,
-  extractStudentResponse
+  extractStudentResponse,
+  evaluateSubjectiveAnswers,
+  evaluateSubjectivePaper
 } from "../controllers/freeOcrController.js";
 
 const router = express.Router();
@@ -67,5 +69,21 @@ router.post("/extract-key", upload.single("file"), extractAnswerKey);
  * @body    file - The student response file
  */
 router.post("/extract-response", upload.single("file"), extractStudentResponse);
+
+/**
+ * @route   POST /api/free-ocr/evaluate-subjective
+ * @desc    Evaluate subjective answers using Groq LLM
+ * @access  Public
+ * @body    { questions: [{ questionText, answerKey, studentAnswer, maxMarks }] }
+ */
+router.post("/evaluate-subjective", evaluateSubjectiveAnswers);
+
+/**
+ * @route   POST /api/free-ocr/evaluate-paper/:paperId
+ * @desc    Evaluate a paper with subjective questions using Groq LLM
+ * @access  Public
+ * @param   paperId - The paper ID to evaluate
+ */
+router.post("/evaluate-paper/:paperId", evaluateSubjectivePaper);
 
 export default router;

@@ -55,6 +55,8 @@ export const compareAnswers = async (req, res) => {
       studentAnswer: "",
       marks: Number(q.marks) || 0,
       isCorrect: false,
+      isFullMarks: false,
+      isPartial: false,
       obtained: 0,
     }));
 
@@ -62,7 +64,7 @@ export const compareAnswers = async (req, res) => {
     let totalMarks = questionStats.reduce((sum, q) => sum + (q.marks || 0), 0);
     let obtainedMarks = 0;
 
-    // STEP 6️⃣: Compare answers
+    // STEP 6️⃣: Compare answers with partial marking for multi-select MCQ
     for (let i = 0; i < studentQuiz.questions.length; i++) {
       const studentQ = studentQuiz.questions[i];
       const correctQ = questionStats[i];
@@ -70,15 +72,41 @@ export const compareAnswers = async (req, res) => {
       const studentAnswer = (studentQ.Answer || studentQ.answer || "").trim();
       const correctAnswer = (correctQ.correctAnswer || "").trim();
 
-      if (normalize(studentAnswer) === normalize(correctAnswer)) {
-        correctQ.isCorrect = true;
-        correctQ.obtained = correctQ.marks;
-        obtainedMarks += correctQ.marks;
+      // Convert answers into arrays (multi-select support)
+      let correctAnswers = correctAnswer
+        .split(",")
+        .map(a => a.trim().toUpperCase())
+        .filter(a => a.length > 0);
+
+      let studentAnswers = studentAnswer
+        .split(",")
+        .map(a => a.trim().toUpperCase())
+        .filter(a => a.length > 0);
+
+      let obtainedForQuestion = 0;
+
+      if (correctAnswers.length > 0) {
+        // Calculate marks per correct option
+        const perOptionMark = correctQ.marks / correctAnswers.length;
+
+        // Award marks for each correct option selected
+        correctAnswers.forEach(correctOpt => {
+          if (studentAnswers.includes(correctOpt)) {
+            obtainedForQuestion += perOptionMark;
+          }
+        });
       } else {
-        correctQ.isCorrect = false;
-        correctQ.obtained = 0;
+        // Fallback to exact match if no comma-separated answers
+        if (normalize(studentAnswer) === normalize(correctAnswer)) {
+          obtainedForQuestion = correctQ.marks;
+        }
       }
 
+      correctQ.obtained = obtainedForQuestion;
+      correctQ.isCorrect = obtainedForQuestion > 0;
+      correctQ.isFullMarks = obtainedForQuestion === correctQ.marks;
+      correctQ.isPartial = obtainedForQuestion > 0 && obtainedForQuestion < correctQ.marks;
+      obtainedMarks += obtainedForQuestion;
       correctQ.studentAnswer = studentAnswer;
     }
 
@@ -157,6 +185,8 @@ export const compareAllAnswers = async (req, res) => {
         studentAnswer: "",
         marks: Number(q.marks) || 0,
         isCorrect: false,
+        isFullMarks: false,
+        isPartial: false,
         obtained: 0,
       }));
 
@@ -190,7 +220,7 @@ export const compareAllAnswers = async (req, res) => {
       .map(a => a.trim().toUpperCase());
   }
 
-  const perOptionMark = correctQ.marks / correctAnswers.length;
+  const perOptionMark = correctQ.marks / Math.max(correctAnswers.length, 1);
 
   let obtainedForQuestion = 0;
 
@@ -206,7 +236,9 @@ export const compareAllAnswers = async (req, res) => {
 
   // Update stats
   correctQ.obtained = obtainedForQuestion;
-  if (obtainedForQuestion > 0) correctQ.isCorrect = true;
+  correctQ.isCorrect = obtainedForQuestion > 0;
+  correctQ.isFullMarks = obtainedForQuestion === correctQ.marks;
+  correctQ.isPartial = obtainedForQuestion > 0 && obtainedForQuestion < correctQ.marks;
 
   obtainedMarks += obtainedForQuestion;
 }

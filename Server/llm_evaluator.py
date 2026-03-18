@@ -13,12 +13,8 @@ import json
 import requests
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env")
-except Exception:
-    # dotenv not available or .env missing — continue using environment
-    pass
+from dotenv import load_dotenv
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -90,8 +86,10 @@ def _similarity(a: str, b: str) -> float:
     # fallback
     return difflib.SequenceMatcher(None, a, b).ratio()
 
+load_dotenv()
+
 # --- Configuration ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_EVAL_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
