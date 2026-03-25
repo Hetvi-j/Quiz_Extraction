@@ -50,6 +50,23 @@ const isNumericallyEqual = (a, b) => {
   return Math.abs(na - nb) < 0.0001;
 };
 
+const extractUnits = (text) => {
+  if (!text) return "";
+  const s = String(text).trim();
+  const numMatch = s.match(/^[-+]?\d+(?:\.\d+)?/);
+  if (!numMatch) return "";
+  let remainder = s.slice(numMatch[0].length).trim();
+  remainder = remainder.replace(/^[\s\-\:\;\,\.]+/, "").replace(/[\,\;\:\.\s]*$/, "").trim();
+  return remainder.toLowerCase();
+};
+
+const unitsMismatch = (a, b) => {
+  const ua = extractUnits(a);
+  const ub = extractUnits(b);
+  if (!ua || !ub) return false;
+  return ua !== ub;
+};
+
 const multiValueMatch = (student, key) => {
   const splitClean = (s) => s.split(",").map(p => p.trim()).filter(Boolean);
   const sParts = splitClean(student);
@@ -99,13 +116,24 @@ const gradeFillBlank = (keyAnswer, studentAnswer, marks) => {
   if (scNorm === kcNorm) return { obtained: marks, feedback: "Correct." };
 
   // 3. Numeric match — ignore units: "23 dB" == "23", "18.4%" == "18.4"
-  //    Student may omit units; the numeric value is what matters for grading.
+  //    But if both sides have units, they must match exactly (to prevent dB vs dBm false positives).
   if (isPrimarilyNumeric(kc)) {
-    if (isNumericallyEqual(sc, kc)) return { obtained: marks, feedback: "Correct numerical value." };
-    // Try stripping units from both sides
-    if (isNumericallyEqual(stripUnits(sc), stripUnits(kc))) {
+    if (unitsMismatch(sc, kc)) {
+      return {
+        obtained: 0,
+        feedback: `Incorrect units. Expected units of "${keyAnswer}" but got "${studentAnswer}".`
+      };
+    }
+
+    if (isNumericallyEqual(sc, kc)) {
+      return { obtained: marks, feedback: "Correct numerical value." };
+    }
+
+    // Try stripping units from both sides only when we do not have a clear unit mismatch
+    if (!unitsMismatch(sc, kc) && isNumericallyEqual(stripUnits(sc), stripUnits(kc))) {
       return { obtained: marks, feedback: "Correct." };
     }
+
     return { obtained: 0, feedback: `Incorrect. Expected: "${keyAnswer}", got: "${studentAnswer}".` };
   }
 
@@ -587,17 +615,24 @@ export const evaluateSubjectivePaper = async (req, res) => {
       const studentAnswerByNum = {};
       // Map 2: by array index 0-based (fallback)
       const studentAnswerByIdx = {};
+      // Map 3: by normalized question text (secondary fallback)
+      const studentAnswerByText = {};
 
       (studentResponse.questions || []).forEach((sq, idx) => {
         const qNum = sq.questionNumber;
+        const answer = sq.answer ?? "";
+        const textKey = cleanText(sq.questionText || "");
+
         if (qNum > 0) {
-          studentAnswerByNum[qNum] = sq.answer ?? "";
+          studentAnswerByNum[qNum] = answer;
         }
-        studentAnswerByIdx[idx] = sq.answer ?? "";
+        studentAnswerByIdx[idx] = answer;
+        if (textKey) studentAnswerByText[textKey] = answer;
       });
 
       // ✅ DEBUG: Log the maps so you can verify in console
       console.log(`   studentAnswerByNum:`, studentAnswerByNum);
+      console.log(`   studentAnswerByText:`, studentAnswerByText);
 
       const studentQCount = Object.keys(studentAnswerByNum).length;
       const keyQCount = answerKey.length;
@@ -624,11 +659,18 @@ export const evaluateSubjectivePaper = async (req, res) => {
           // Primary: by question number (most reliable)
           studentAnswer = studentAnswerByNum[questionNum];
         } else if (studentAnswerByIdx.hasOwnProperty(i)) {
-          // Fallback: by position in array (if OCR numbering was off)
+          // First fallback: by position in array (if OCR numbering was off)
           studentAnswer = studentAnswerByIdx[i];
           console.warn(`   ⚠️  Q${questionNum}: not found by number, using position ${i} → "${studentAnswer}"`);
         } else {
-          console.warn(`   ⚠️  Q${questionNum}: not found in student response → 0 marks`);
+          // Secondary fallback: by normalized question text
+          const keyText = cleanText(keyQ.questionText || "");
+          if (keyText && studentAnswerByText[keyText] !== undefined) {
+            studentAnswer = studentAnswerByText[keyText];
+            console.warn(`   ⚠️  Q${questionNum}: not found by index/number, using text match → "${studentAnswer}"`);
+          } else {
+            console.warn(`   ⚠️  Q${questionNum}: not found in student response → 0 marks`);
+          }
         }
 
         console.log(`   Q${questionNum} [${questionType}] marks=${marks} key="${keyAnswer}" student="${studentAnswer}"`);

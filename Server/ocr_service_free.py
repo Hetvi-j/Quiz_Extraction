@@ -909,6 +909,17 @@ def process_file(file_bytes: bytes, filename: str, is_answer_key: bool = False, 
                     except Exception as e:
                         print(f"  ⚠️ Page {page_idx + 1} {half_label} failed: {e}")
 
+                # ── Intra-page overlap extraction (half-bridge) ───────────────
+                try:
+                    print(f"    Creating half-bridge for page {page_idx + 1}...")
+                    half_bridge = create_bridge_image(top_half, bottom_half)
+                    result = extract_with_groq([half_bridge], is_bridge=True, is_answer_key=is_answer_key, question_types=question_types)
+                    half_bridge_qs = result.get("questions", [])
+                    print(f"     Page {page_idx + 1} HALF-BRIDGE → {len(half_bridge_qs)} question(s)")
+                    page_qs.extend(half_bridge_qs)
+                except Exception as e:
+                    print(f"  ⚠️ Page {page_idx + 1} HALF-BRIDGE failed: {e}")
+
                 all_questions.extend(page_qs)
         else:
             # Batch of 5 for large PDFs
