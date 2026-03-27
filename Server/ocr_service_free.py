@@ -64,6 +64,20 @@ MAX_RETRIES      = 5
 OVERLAP_RATIO    = 0.40   # 40% overlap for bridge images (v6 had 30%, increased for safety)
 RENDER_SCALE     = 300 / 72  # 300 DPI (v1 used 200 DPI, v6 used 300 DPI — use 300 for quality)
 
+# Confidence + retry (for student sheet extraction)
+# Groq/OpenAI-compatible APIs don't expose token-level logprobs here,
+# so we rely on model self-confidence + lightweight structural validation.
+CONFIDENCE_THRESHOLD           = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
+MAX_CONFIDENCE_RETRIES         = int(os.environ.get("MAX_CONFIDENCE_RETRIES", "1"))
+CONFIDENCE_RECHECK_TEMPERATURE = float(os.environ.get("CONFIDENCE_RECHECK_TEMPERATURE", "0.0"))
+CONFIDENCE_BASE_TEMPERATURE    = float(os.environ.get("CONFIDENCE_BASE_TEMPERATURE", "0.1"))
+
+# Agreement-based confidence (more reliable than model self-rating)
+# when the model outputs high confidence but still makes the same mistakes.
+AGREEMENT_CONFIDENCE_ENABLE        = os.environ.get("AGREEMENT_CONFIDENCE_ENABLE", "1").lower() in ("1", "true", "yes")
+AGREEMENT_OVERALL_MIN_SELFCONF    = float(os.environ.get("AGREEMENT_OVERALL_MIN_SELFCONF", "0.90"))  # only do agreement check when self-confidence is very high
+AGREEMENT_ALTERNATE_TEMPERATURE   = float(os.environ.get("AGREEMENT_ALTERNATE_TEMPERATURE", "0.35"))
+
 last_api_call_time = 0
 
 # v1: Question type normalization map — handles all Groq variations
@@ -195,6 +209,26 @@ def image_to_base64(image: PILImage.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def preprocess_for_ocr(image: PILImage.Image) -> PILImage.Image:
+    """
+    Light preprocessing to make handwritten ticks/ink clearer for OCR.
+    Runs locally (no extra API calls).
+    """
+    try:
+        from PIL import ImageEnhance, ImageFilter
+
+        gray = image.convert("L")
+        # Increase contrast + clarity; ticks are usually thin dark strokes.
+        gray = ImageEnhance.Contrast(gray).enhance(1.8)
+        gray = ImageEnhance.Sharpness(gray).enhance(1.4)
+        # Reduce noise without destroying thin lines too much.
+        gray = gray.filter(ImageFilter.MedianFilter(size=3))
+        # Back to RGB for consistent downstream handling.
+        return gray.convert("RGB")
+    except Exception:
+        return image
+
+
 def create_bridge_image(page_a: PILImage.Image, page_b: PILImage.Image) -> PILImage.Image:
     """
     Stitch the bottom OVERLAP_RATIO of page_a with the top OVERLAP_RATIO of page_b.
@@ -248,6 +282,7 @@ def pdf_to_images(pdf_bytes: bytes) -> tuple[list, list]:
         page    = pdf[page_num]
         bitmap  = page.render(scale=RENDER_SCALE)
         pil_img = bitmap.to_pil()
+        pil_img = preprocess_for_ocr(pil_img)
         pages.append(pil_img)
         print(f"    Page {page_num+1}: {pil_img.size[0]}x{pil_img.size[1]} px")
 
@@ -384,6 +419,15 @@ def post_process_question(q: dict, idx: int, question_types: dict = None) -> dic
     raw_ans    = q.get("Answer")
     q["Answer"] = normalize_answer(raw_ans)
 
+    # ── AnswerConservative (strict) ─────────────────────────────────────
+    # For MCQ/TRUE_FALSE, prefer the conservative answer when available.
+    # This prevents the model from repeatedly guessing the same wrong tick.
+    if "AnswerConservative" in q:
+        q["AnswerConservative"] = normalize_answer(q.get("AnswerConservative"))
+        if q["questionType"] in ("MCQ", "TRUE_FALSE"):
+            cons = (q.get("AnswerConservative") or "").strip()
+            q["Answer"] = cons if cons else ""
+
     # If Groq labeled it as MCQ but the answer is not a letter/letter-list,
     # treat it as a fill-in-the-blank (common for questions like Q13/14).
     if q["questionType"] == "MCQ":
@@ -451,6 +495,8 @@ def post_process_question(q: dict, idx: int, question_types: dict = None) -> dic
                 break
 
     # ── Debug log ────────────────────────────────────────────────────────
+    # Confidence normalization (model-provided `confidence` or heuristic fallback).
+    q["confidence"] = normalize_confidence(q)
     print(f"  📌 Q{q['questionNumber']} [{q['questionType']}]: Answer={q['Answer']!r}  (raw={raw_ans!r})")
     return q
 
@@ -479,11 +525,172 @@ def post_process_questions(questions: list) -> list:
     return [v for _, v in sorted(seen.items())]
 
 
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def _parse_confidence_value(v) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return clamp01(float(v))
+    if isinstance(v, str):
+        s = v.strip()
+        # allow "0.72" or "72%" styles
+        if s.endswith("%"):
+            try:
+                return clamp01(float(s[:-1]) / 100.0)
+            except ValueError:
+                return None
+        try:
+            return clamp01(float(s))
+        except ValueError:
+            return None
+    return None
+
+
+def fallback_confidence_for_question(q: dict) -> float:
+    """
+    Heuristic fallback when the model doesn't include `confidence`.
+    This is not as good as model self-scoring, but still gives us a way
+    to decide whether to retry.
+    """
+    qtype = (q.get("questionType") or "").upper().strip()
+    ans = (q.get("Answer") or "").strip()
+
+    if not ans:
+        # Empty answer is usually less reliable for MCQ/TF papers.
+        return 0.2 if qtype in ("MCQ", "TRUE_FALSE") else 0.1
+
+    if qtype == "MCQ":
+        # Format-correct MCQ answers can still be wrong (tick misread),
+        # but we keep confidence moderate to avoid trusting self-ratings.
+        return 0.7 if re.fullmatch(r"[A-D](?:,[A-D])*", ans) else 0.25
+
+    if qtype == "TRUE_FALSE":
+        return 0.7 if re.match(r"^(true|false)\b", ans, re.IGNORECASE) else 0.35
+
+    if qtype in ("SHORT", "LONG"):
+        return 0.6
+
+    if qtype == "FILL_BLANK":
+        # Fill answers should not look like MCQ letters-only.
+        return 0.6 if ans and not re.fullmatch(r"[A-D]", ans, re.IGNORECASE) else 0.25
+
+    return 0.5
+
+
+def normalize_confidence(q: dict) -> float:
+    # Important: the model's own `confidence` field has been observed to be unreliable
+    # on this dataset. We therefore ignore it and use our deterministic fallback.
+    return fallback_confidence_for_question(q)
+
+
+def compute_overall_confidence(questions: list) -> float:
+    confs: list[float] = []
+    for q in questions or []:
+        try:
+            confs.append(normalize_confidence(q))
+        except Exception:
+            # Never crash extraction due to confidence formatting.
+            pass
+    if not confs:
+        return 0.0
+    return sum(confs) / len(confs)
+
+
+def extraction_low_confidence(result: dict) -> bool:
+    overall = result.get("overallConfidence")
+    if isinstance(overall, (int, float)):
+        overall_ok = float(overall) >= CONFIDENCE_THRESHOLD
+    else:
+        overall_ok = compute_overall_confidence(result.get("questions", [])) >= CONFIDENCE_THRESHOLD
+
+    # For your main issue (MCQ tick marks), prefer retrying when any MCQ/TF looks uncertain.
+    questions = result.get("questions", []) or []
+    critical = [
+        normalize_confidence(q)
+        for q in questions
+        if (q.get("questionType") or "").upper().strip() in ("MCQ", "TRUE_FALSE")
+    ]
+    if critical and min(critical) < CONFIDENCE_THRESHOLD:
+        return True
+
+    return not overall_ok
+
+
+def _normalize_answer_for_agreement(question_type: str, answer: str) -> str:
+    """
+    Normalize Answer strings so that "C" vs "c" or "True - ..." comparisons match.
+    """
+    qtype = (question_type or "").upper().strip()
+    a = (answer or "").strip()
+    if qtype == "MCQ":
+        a = a.replace(" ", "").upper()
+        # Accept "A,C" style
+        letters = re.findall(r"[A-D]", a.upper())
+        if not letters:
+            return ""
+        # keep order but dedupe
+        seen, uniq = set(), []
+        for l in letters:
+            if l not in seen:
+                seen.add(l)
+                uniq.append(l)
+        return ",".join(uniq)
+    if qtype == "TRUE_FALSE":
+        m = re.match(r"^(true|false)", a, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        return m.group(1).capitalize()
+    # For subjective/FILL_BLANK, compare full string as-is
+    return a
+
+
+def compute_agreement_confidence(result_a: dict, result_b: dict) -> float:
+    """
+    Agreement-based confidence: fraction of MCQ/TRUE_FALSE answers that match between
+    two independent extractions.
+    """
+    questions_a = result_a.get("questions", []) or []
+    questions_b = result_b.get("questions", []) or []
+    by_num_b = {}
+    for q in questions_b:
+        try:
+            by_num_b[int(q.get("questionNumber"))] = q
+        except Exception:
+            continue
+
+    critical_matches = 0
+    critical_total = 0
+    for q in questions_a:
+        qtype = (q.get("questionType") or "").upper().strip()
+        if qtype not in ("MCQ", "TRUE_FALSE"):
+            continue
+        qnum = q.get("questionNumber")
+        try:
+            qnum_int = int(qnum)
+        except Exception:
+            continue
+        qb = by_num_b.get(qnum_int)
+        if not qb:
+            continue
+        critical_total += 1
+        a1 = _normalize_answer_for_agreement(qtype, q.get("Answer") or "")
+        a2 = _normalize_answer_for_agreement(qtype, qb.get("Answer") or "")
+        if a1 == a2:
+            critical_matches += 1
+
+    if critical_total == 0:
+        return 0.0
+    return critical_matches / critical_total
+
+
 # ─────────────────────────────────────────────
 # Groq Prompts
 # ─────────────────────────────────────────────
 
-def build_main_prompt(num_pages: int, question_types: dict = None) -> str:
+def build_main_prompt(num_pages: int, question_types: dict = None, recheck_mode: bool = False) -> str:
     # Build question type hints block if we have them from the answer key
     if question_types:
         lines = ["⚠️ KNOWN QUESTION TYPES FROM ANSWER KEY — USE THESE EXACTLY, DO NOT RE-DETECT:"]
@@ -497,6 +704,17 @@ def build_main_prompt(num_pages: int, question_types: dict = None) -> str:
         qt_hints = "\n".join(lines) + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     else:
         qt_hints = ""
+
+    recheck_block = ""
+    if recheck_mode:
+        recheck_block = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 RECHECK MODE (IMPORTANT)
+Only select MCQ options if you are confident there is a PHYSICAL student mark.
+If an option mark is ambiguous, set Answer="" for that MCQ (do not guess).
+Also ensure `questionText` does NOT include (a)/(b)/(c)/(d) option labels.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
 
     prompt = f"""You are an expert exam paper OCR system analyzing a STUDENT ANSWER SHEET.
 Look at these {num_pages} page(s) and extract EVERY SINGLE question with the student's marked answers.
@@ -520,9 +738,13 @@ Return a JSON object with EXACTLY this structure:
       "questionType": "MCQ or SHORT or LONG or TRUE_FALSE or FILL_BLANK",
       "marks": <exact marks as printed — can be 0.5, 1, 1.5, 2, 3, 4, 5 or any decimal>,
       "options": ["A) option text", "B) option text", "C) option text", "D) option text"],
-      "Answer": "see format rules below"
+      "Answer": "see format rules below",
+      "AnswerConservative": "see format rules below (STRICT: for MCQ/TRUE_FALSE, output '' if you cannot clearly see the student mark)",
+      "confidence": <number between 0 and 1 where 1=very confident, 0=not confident>
     }}
   ]
+  ,
+  "overallConfidence": <number between 0 and 1>
 }}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -575,6 +797,11 @@ What counts as a student mark:
   YES: Circle drawn around the option letter or text — even wobbly
   YES: Underline drawn beneath the option text
   YES: Any deliberate pen/pencil stroke physically ON a specific option
+
+For `AnswerConservative` (STRICT mode):
+  • Use the exact same YES/NO tests above.
+  • If you cannot clearly detect a YES mark on any option, set AnswerConservative = "" (do not guess).
+  • Do NOT guess based on printed option labels or exam patterns.
 
 What does NOT count:
   NO: The printed "(a)" "(b)" "(c)" "(d)" labels with no student ink on them
@@ -652,6 +879,11 @@ ANSWER FORMAT:
   □ "Answer" is never null — use "" for no answer
 
 Return ONLY valid JSON — no explanation text."""
+    if recheck_mode:
+        prompt = prompt.replace(
+            "You are an expert exam paper OCR system analyzing a STUDENT ANSWER SHEET.\n",
+            "You are an expert exam paper OCR system analyzing a STUDENT ANSWER SHEET.\n" + recheck_block + "\n"
+        )
     return prompt
 
 
@@ -735,7 +967,7 @@ Then Answer must be:
    0.5 persistent. This reflects in increased throughput."
 
 DO NOT return just "True" — that loses the justification used for grading.
-
+try to extract6 whole text
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ANSWER FORMAT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -755,8 +987,18 @@ ANSWER FORMAT:
 Return ONLY valid JSON — no explanation text."""
 
 
-def build_bridge_prompt() -> str:
-    return """You are an expert exam paper OCR system analyzing a BRIDGE IMAGE.
+def build_bridge_prompt(recheck_mode: bool = False) -> str:
+    recheck_block = ""
+    if recheck_mode:
+        recheck_block = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 RECHECK MODE (IMPORTANT)
+Only select MCQ options if you are confident there is a PHYSICAL student mark.
+If ambiguous, do not guess.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+    prompt = """You are an expert exam paper OCR system analyzing a BRIDGE IMAGE.
 This image shows the BOTTOM of one exam page stitched with the TOP of the next page.
 Extract ONLY questions that span the boundary (question text on one half, options/answer on the other).
 
@@ -770,9 +1012,12 @@ Return a JSON object:
       "questionType": "MCQ or SHORT or LONG or TRUE_FALSE or FILL_BLANK",
       "marks": <exact marks as printed — can be 0.5, 1, 2, 3, 4, 5 or any decimal. ½ = 0.5>,
       "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
-      "Answer": "B" or "A,C" or "" or "True - justification text"
+      "Answer": "B" or "A,C" or "" or "True - justification text",
+      "AnswerConservative": "B" or "A,C" or "" or "True - justification text (STRICT: output '' if mark/True-False is unclear)",
+      "confidence": <number between 0 and 1>
     }
-  ]
+  ],
+  "overallConfidence": <number between 0 and 1>
 }
 
 CROSS-PAGE RULE: If MCQ options (A/B/C/D) appear at the top of the lower half,
@@ -782,6 +1027,9 @@ MARK DETECTION (70% confidence):
   ✅ Tick (✓), Circle, Underline, deliberate ink near option = MARKED
   ❌ Cross/X = CANCELLED (not a selection)
   No mark anywhere = Answer: ""
+For `AnswerConservative` (STRICT mode):
+  • If no option is clearly MARKED, set AnswerConservative = "" (do not guess).
+  • Do NOT infer from printed option labels or common answer patterns.
 
 TRUE_FALSE answers: include the FULL justification text after True/False.
   e.g. "True - probability of collision is 5 times less" 
@@ -789,12 +1037,24 @@ TRUE_FALSE answers: include the FULL justification text after True/False.
 
 Return ONLY valid JSON — no explanation text."""
 
+    if recheck_mode:
+        prompt = prompt.replace("You are an expert exam paper OCR system analyzing a BRIDGE IMAGE.\n",
+                                "You are an expert exam paper OCR system analyzing a BRIDGE IMAGE.\n" + recheck_block + "\n")
+    return prompt
+
 
 # ─────────────────────────────────────────────
 # Core Extraction
 # ─────────────────────────────────────────────
 
-def extract_with_groq(images: list, is_bridge: bool = False, is_answer_key: bool = False, question_types: dict = None) -> dict:
+def extract_with_groq(
+    images: list,
+    is_bridge: bool = False,
+    is_answer_key: bool = False,
+    question_types: dict = None,
+    temperature: float = CONFIDENCE_BASE_TEMPERATURE,
+    recheck_mode: bool = False,
+) -> dict:
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured.")
 
@@ -804,13 +1064,13 @@ def extract_with_groq(images: list, is_bridge: bool = False, is_answer_key: bool
     ]
 
     if is_bridge:
-        prompt = build_bridge_prompt()
+        prompt = build_bridge_prompt(recheck_mode=recheck_mode)
         label  = "BRIDGE"
     elif is_answer_key:
         prompt = build_answer_key_prompt(len(images))
         label  = f"ANSWER KEY {len(images)} page(s)"
     else:
-        prompt = build_main_prompt(len(images), question_types)
+        prompt = build_main_prompt(len(images), question_types, recheck_mode=recheck_mode)
         label  = f"{len(images)} page(s)"
 
     content = image_contents + [{"type": "text", "text": prompt}]
@@ -818,7 +1078,7 @@ def extract_with_groq(images: list, is_bridge: bool = False, is_answer_key: bool
     payload = {
         "model":           GROQ_MODEL,
         "messages":        [{"role": "user", "content": content}],
-        "temperature":     0.1,
+        "temperature":     temperature,
         "max_tokens":      8192,
         "response_format": {"type": "json_object"}
     }
@@ -849,8 +1109,10 @@ def extract_with_groq(images: list, is_bridge: bool = False, is_answer_key: bool
         for idx, q in enumerate(parsed.get("questions", []), start=1):
             post_process_question(q, idx, question_types=question_types)
 
+        # Confidence-driven retry uses this value.
+        parsed["overallConfidence"] = compute_overall_confidence(parsed.get("questions", []))
         num_q = len(parsed.get("questions", []))
-        print(f"✅ Extracted {num_q} questions from {label}")
+        print(f"✅ Extracted {num_q} questions from {label} (overallConfidence={parsed['overallConfidence']:.3f})")
         return parsed
 
     except HTTPException:
@@ -863,6 +1125,79 @@ def extract_with_groq(images: list, is_bridge: bool = False, is_answer_key: bool
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Groq extraction failed: {e}")
+
+
+def extract_with_confidence_retry(
+    images: list,
+    is_bridge: bool = False,
+    is_answer_key: bool = False,
+    question_types: dict = None,
+) -> dict:
+    """
+    Extract using Groq, then (if student-sheet extraction and confidence is low)
+    re-run in RECHECK_MODE to reduce MCQ tick-mark mistakes and wrong text extraction.
+    """
+    # First attempt
+    result = extract_with_groq(
+        images=images,
+        is_bridge=is_bridge,
+        is_answer_key=is_answer_key,
+        question_types=question_types,
+        temperature=CONFIDENCE_BASE_TEMPERATURE,
+        recheck_mode=False,
+    )
+
+    # Only retry for student sheets (mark detection)
+    if is_answer_key or MAX_CONFIDENCE_RETRIES <= 0:
+        return result
+
+    retries = 0
+    while retries < MAX_CONFIDENCE_RETRIES and extraction_low_confidence(result):
+        retries += 1
+        print(f"  ⚠️ Low confidence (overallConfidence={result.get('overallConfidence')}) — retry {retries}/{MAX_CONFIDENCE_RETRIES} with RECHECK_MODE...")
+        result = extract_with_groq(
+            images=images,
+            is_bridge=is_bridge,
+            is_answer_key=is_answer_key,
+            question_types=question_types,
+            temperature=CONFIDENCE_RECHECK_TEMPERATURE,
+            recheck_mode=True,
+        )
+
+    # If self-confidence is very high but answers might still be wrong,
+    # do an agreement check between two different temperatures.
+    try:
+        overall_self = float(result.get("overallConfidence", 0.0))
+    except Exception:
+        overall_self = 0.0
+
+    if not AGREEMENT_CONFIDENCE_ENABLE or is_answer_key:
+        return result
+
+    if overall_self >= AGREEMENT_OVERALL_MIN_SELFCONF:
+        alt_result = extract_with_groq(
+            images=images,
+            is_bridge=is_bridge,
+            is_answer_key=is_answer_key,
+            question_types=question_types,
+            temperature=AGREEMENT_ALTERNATE_TEMPERATURE,
+            recheck_mode=False,
+        )
+        agreement_conf = compute_agreement_confidence(result, alt_result)
+        result["overallAgreementConfidence"] = agreement_conf
+        print(f"  📊 Agreement confidence={agreement_conf:.3f} (self={overall_self:.3f})")
+        if agreement_conf < CONFIDENCE_THRESHOLD:
+            print(f"  ⚠️ Agreement confidence below threshold — retrying with RECHECK_MODE...")
+            result = extract_with_groq(
+                images=images,
+                is_bridge=is_bridge,
+                is_answer_key=is_answer_key,
+                question_types=question_types,
+                temperature=CONFIDENCE_RECHECK_TEMPERATURE,
+                recheck_mode=True,
+            )
+
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -898,7 +1233,7 @@ def process_file(file_bytes: bytes, filename: str, is_answer_key: bool = False, 
 
                 for half_label, half_img in [("TOP", top_half), ("BOTTOM", bottom_half)]:
                     try:
-                        result = extract_with_groq([half_img], is_bridge=False, is_answer_key=is_answer_key, question_types=question_types)
+                        result = extract_with_confidence_retry([half_img], is_bridge=False, is_answer_key=is_answer_key, question_types=question_types)
                         page_doc_info = result.get("documentInfo", {})
                         if page_doc_info.get("enrollmentNumber") and page_doc_info["enrollmentNumber"] != "0":
                             if doc_info["enrollmentNumber"] == "0":
@@ -913,7 +1248,7 @@ def process_file(file_bytes: bytes, filename: str, is_answer_key: bool = False, 
                 try:
                     print(f"    Creating half-bridge for page {page_idx + 1}...")
                     half_bridge = create_bridge_image(top_half, bottom_half)
-                    result = extract_with_groq([half_bridge], is_bridge=True, is_answer_key=is_answer_key, question_types=question_types)
+                    result = extract_with_confidence_retry([half_bridge], is_bridge=True, is_answer_key=is_answer_key, question_types=question_types)
                     half_bridge_qs = result.get("questions", [])
                     print(f"     Page {page_idx + 1} HALF-BRIDGE → {len(half_bridge_qs)} question(s)")
                     page_qs.extend(half_bridge_qs)
@@ -928,7 +1263,7 @@ def process_file(file_bytes: bytes, filename: str, is_answer_key: bool = False, 
                 batch = pages[i:i + 5]
                 print(f"\n  📄 Processing pages {i+1}–{i+len(batch)} [{mode_label}]...")
                 try:
-                    result        = extract_with_groq(batch, is_bridge=False, is_answer_key=is_answer_key, question_types=question_types)
+                    result        = extract_with_confidence_retry(batch, is_bridge=False, is_answer_key=is_answer_key, question_types=question_types)
                     page_doc_info = result.get("documentInfo", {})
                     if page_doc_info.get("enrollmentNumber") and page_doc_info["enrollmentNumber"] != "0":
                         if doc_info["enrollmentNumber"] == "0":
@@ -944,7 +1279,7 @@ def process_file(file_bytes: bytes, filename: str, is_answer_key: bool = False, 
             for i, bridge in enumerate(bridge_pages):
                 print(f"\n  🔗 Processing bridge {i+1}↔{i+2}...")
                 try:
-                    result    = extract_with_groq([bridge], is_bridge=True, is_answer_key=False, question_types=question_types)
+                    result    = extract_with_confidence_retry([bridge], is_bridge=True, is_answer_key=False, question_types=question_types)
                     bridge_qs = result.get("questions", [])
                     print(f"     Bridge → {len(bridge_qs)} question(s)")
                     all_questions.extend(bridge_qs)
@@ -959,7 +1294,8 @@ def process_file(file_bytes: bytes, filename: str, is_answer_key: bool = False, 
     elif ext in (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"):
         print(f"Processing image ({mode_label}): {filename}")
         image = PILImage.open(io.BytesIO(file_bytes)).convert("RGB")
-        return extract_with_groq([image], is_answer_key=is_answer_key, question_types=question_types)
+        image = preprocess_for_ocr(image)
+        return extract_with_confidence_retry([image], is_bridge=False, is_answer_key=is_answer_key, question_types=question_types)
 
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
@@ -1165,7 +1501,8 @@ Meaning matters more than exact wording. Award partial marks for partial answers
 Return ONLY JSON: {{"obtained_marks":<0 to {max_marks}>,"percentage":<pct>,"feedback":"<1-2 sentences>","correct_points":[],"missing_points":[],"extra_points":[]}}"""
 
     payload = {
-        "model":   "llama-3.3-70b-versatile",
+        # "model":   "llama-3.3-70b-versatile",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
         "messages": [
             {"role": "system", "content": "You are an expert academic evaluator. Always respond with valid JSON only."},
             {"role": "user",   "content": prompt}
