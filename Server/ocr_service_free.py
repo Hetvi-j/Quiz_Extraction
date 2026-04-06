@@ -398,7 +398,13 @@ def post_process_question(q: dict, idx: int, question_types: dict = None) -> dic
 
     # ── Answer ──────────────────────────────────────────────────────────
     raw_ans    = q.get("Answer")
-    q["Answer"] = normalize_answer(raw_ans)
+    normalized = normalize_answer(raw_ans)
+    q["Answer"] = normalized
+    
+    # DEBUG: Log the transformation
+    qnum = q.get("questionNumber", idx)
+    qtype = q.get("questionType", "MCQ")
+    print(f"  [DEBUG] Q{qnum} [{qtype}]: Raw={raw_ans!r} → Normalized={normalized!r}")
 
     # If Groq labeled it as MCQ but the answer is not a letter/letter-list,
     # treat it as a fill-in-the-blank (common for questions like Q13/14).
@@ -407,6 +413,7 @@ def post_process_question(q: dict, idx: int, question_types: dict = None) -> dic
         if ans and not re.fullmatch(r'[A-D](?:,[A-D])*', ans):
             q["questionType"] = "FILL_BLANK"
             q["options"] = []
+            print(f"  [DEBUG] Q{qnum}: MCQ answer '{ans}' is not A-D format, converted to FILL_BLANK")
 
     # For MCQ: only allow A-D (standard 4-option paper), strip E and beyond
     if q["questionType"] == "MCQ" and q["Answer"]:
@@ -416,7 +423,10 @@ def post_process_question(q: dict, idx: int, question_types: dict = None) -> dic
             if l not in seen:
                 seen.add(l)
                 unique.append(l)
-        q["Answer"] = ",".join(unique) if unique else ""
+        final_ans = ",".join(unique) if unique else ""
+        if final_ans != q["Answer"]:
+            print(f"  [DEBUG] Q{qnum}: Deduped answer from '{q['Answer']}' → '{final_ans}'")
+        q["Answer"] = final_ans
 
     # For TRUE_FALSE: normalize casing of the T/F part but PRESERVE justification.
     # e.g. "true - probability of collision is 5 times less" → "True - probability of collision is 5 times less"
@@ -481,6 +491,8 @@ def post_process_questions(questions: list) -> list:
     (bridge vs. page) which indicates a reliability issue with Groq.
     """
     seen: dict[int, dict] = {}
+    conflicts_found = []
+    
     for q in questions:
         if q.get("options") is None:
             q["options"] = []
@@ -498,17 +510,33 @@ def post_process_questions(questions: list) -> list:
             if existing_ans and new_ans and existing_ans != new_ans:
                 qtype = seen[qnum].get("questionType", "UNKNOWN")
                 qtext = seen[qnum].get("questionText", "")[:60]
-                print(f"  ⚠️ INCONSISTENT Q{qnum} [{qtype}]: existing='{existing_ans}' vs. new='{new_ans}'")
+                conflict_msg = f"Q{qnum} [{qtype}]: existing='{existing_ans}' vs. new='{new_ans}'"
+                print(f"  ⚠️ INCONSISTENT {conflict_msg}")
                 print(f"     Text: {qtext}...")
+                conflicts_found.append(conflict_msg)
             
             # Prefer extraction with more options
             if new_opts > existing_opts:
+                print(f"  [DEDUP] Q{qnum}: Replacing (more options: {new_opts} > {existing_opts})")
                 seen[qnum] = q
             elif new_opts == existing_opts:
                 # If same options, prefer the one with a non-empty answer
                 if not existing_ans and new_ans:
+                    print(f"  [DEDUP] Q{qnum}: Replacing (empty→'{new_ans}')")
                     seen[qnum] = q
-    return [v for _, v in sorted(seen.items())]
+                elif existing_ans:
+                    print(f"  [DEDUP] Q{qnum}: Keeping existing (both have answer)")
+    
+    result = [v for _, v in sorted(seen.items())]
+    
+    if conflicts_found:
+        print(f"\n{'='*60}")
+        print(f"⚠️  FOUND {len(conflicts_found)} ANSWER CONFLICTS DURING DEDUP:")
+        for conflict in conflicts_found:
+            print(f"  - {conflict}")
+        print(f"{'='*60}\n")
+    
+    return result
 
 
 # ─────────────────────────────────────────────
