@@ -42,6 +42,9 @@ export const addToQuestionBank = async (subject, questions, fileName, subjectId 
         (q) => normalizeText(q.questionText) === normalizedNewText
       );
 
+      // Handle both capitalized and lowercase answer field names
+      const answerValue = newQuestion.answer || newQuestion.Answer || "";
+
       if (existingIndex !== -1) {
         // Duplicate found - increment frequency and add source file
         bank.questions[existingIndex].frequency += 1;
@@ -56,7 +59,7 @@ export const addToQuestionBank = async (subject, questions, fileName, subjectId 
           questionType: newQuestion.questionType || "",
           marks: newQuestion.marks || 0,
           options: newQuestion.options || [],
-          answer: newQuestion.Answer || newQuestion.answer || "",
+          answer: answerValue,
           frequency: 1,
           sourceFiles: [fileName],
           addedAt: new Date()

@@ -175,6 +175,7 @@ import path from "path";
 import FormData from "form-data";
 import Quiz1 from "../models/quiz_new.js";
 import { addToQuestionBank } from "./questionBankController.js";
+import { normalizeQuestion, validateAnswerConsistency } from "../utils/answerExtractor.js";
 
 const VA_API_KEY =
   "NGQyeWhrM2FrbGE4c3RtOTk2d3B3Om1TbnZzWEMyalJHdXJTMW9EaDFQM2NSVG9aYjNnajB6";
@@ -224,7 +225,7 @@ const schemaContent = {
           },
           questionType: {
             type: "string",
-            description: "The type of the question.",
+            description: "The type of the question (MCQ, SHORT, LONG, TRUE_FALSE, etc.).",
           },
           marks: {
             type: "number",
@@ -232,14 +233,14 @@ const schemaContent = {
           },
           options: {
             type: "array",
-            description: "List of possible answer options.",
+            description: "List of possible answer options (for MCQ type, include all options like A, B, C, D).",
             items: {
               type: "string",
             },
           },
-          Answer: {
+          answer: {
             type: "string",
-            description: "All correct answers, concatenated into a single string, separated by a comma and space.",
+            description: "The correct answer. For MCQs with multiple correct answers, concatenate them separated by comma (e.g., 'A, C'). Extract the letter/option itself, not the full text.",
           },
          
         },
@@ -325,10 +326,35 @@ export const extractQuizzesFromFolder = async (req, res) => {
 
         const extraction = extractResponse.data.extraction || {};
 
+        // Normalize and validate extracted questions
+        const normalizedQuestions = (extraction.questions || []).map((q, idx) => {
+          // First normalize field names and answer format
+          const questionData = {
+            ...q,
+            answer: q.answer || q.Answer || "",  // Normalize field name to lowercase 'answer'
+            Answer: undefined  // Remove capitalized version
+          };
+          
+          // Apply full normalization
+          const normalized = normalizeQuestion(questionData);
+          
+          // Log validation warnings if any
+          const validation = validateAnswerConsistency(normalized);
+          if (!validation.isValid) {
+            validation.warnings.forEach(warning => {
+              console.warn(`⚠️ Question ${idx + 1}: ${warning}`);
+            });
+          } else {
+            console.log(`✅ Question ${idx + 1}: Answer extracted correctly - "${normalized.answer}"`);
+          }
+          
+          return normalized;
+        });
+
         const quiz = new Quiz1({
           file_name: fileName,
           documentInfo: extraction.documentInfo || {},
-          questions: extraction.questions || []
+          questions: normalizedQuestions
         });
 
         await quiz.save();
@@ -339,13 +365,13 @@ export const extractQuizzesFromFolder = async (req, res) => {
         // --------------------
         const enrollmentNumber = extraction.documentInfo?.enrollmentNumber;
         if (
-          extraction.questions &&
-          extraction.questions.length > 0 &&
+          normalizedQuestions &&
+          normalizedQuestions.length > 0 &&
           enrollmentNumber === 0
         ) {
           const bankResult = await addToQuestionBank(
             subject,
-            extraction.questions,
+            normalizedQuestions,
             fileName
           );
           console.log(`📚 Question Bank (Answer Key): ${bankResult.message}`);

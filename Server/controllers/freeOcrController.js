@@ -5,6 +5,7 @@ import QuestionBank from "../models/QuestionBank.js";
 import Subject from "../models/Subject.js";
 import Paper from "../models/Paper.js";
 import Result from "../models/Result.js";
+import { extractMCQAnswer, normalizeQuestion } from "../utils/answerExtractor.js";
 
 const FREE_OCR_SERVICE_URL = process.env.FREE_OCR_SERVICE_URL || "http://localhost:8001";
 
