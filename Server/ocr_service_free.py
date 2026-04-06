@@ -270,7 +270,7 @@ def normalize_answer(raw_answer) -> str:
     """
     Convert any Answer value Groq returns into a clean string.
     Never returns None. Maps UNMARKED/None/null → "".
-    MCQ: returns "A,C" format.
+    MCQ: returns "A,C" format (always UPPERCASE letters).
     """
     if raw_answer is None:
         return ""
@@ -311,6 +311,22 @@ def normalize_answer(raw_answer) -> str:
             return ",".join(unique)
         inner = ans[1:-1].strip().strip("'\"")
         return "" if inner.lower() in _NO_ANSWER_STRINGS else inner
+
+    # Check if this is a single MCQ letter answer (a/b/c/d or A/B/C/D)
+    # If so, normalize to uppercase
+    if re.match(r'^[a-dA-D]$', ans):
+        return ans.upper()
+    
+    # Check for comma-separated MCQ letters like "a,c" → "A,C"
+    if re.match(r'^[a-dA-D](,[a-dA-D])*$', ans):
+        letters = [letter.upper() for letter in ans.replace(" ", "").split(",")]
+        # Deduplicate while preserving order
+        seen, unique = set(), []
+        for l in letters:
+            if l not in seen:
+                seen.add(l)
+                unique.append(l)
+        return ",".join(unique)
 
     return ans
 
@@ -460,6 +476,9 @@ def post_process_questions(questions: list) -> list:
     """
     v6: Deduplicate questions from overlapping page/bridge extractions.
     Richer extraction (more options, non-empty answer) wins.
+    
+    Also logs when the SAME question gets DIFFERENT answers from different extractions
+    (bridge vs. page) which indicates a reliability issue with Groq.
     """
     seen: dict[int, dict] = {}
     for q in questions:
@@ -469,12 +488,25 @@ def post_process_questions(questions: list) -> list:
         if qnum not in seen:
             seen[qnum] = q
         else:
+            # Check for answer consistency
+            existing_ans = (seen[qnum].get("Answer") or "").strip()
+            new_ans = (q.get("Answer") or "").strip()
             existing_opts = len(seen[qnum].get("options") or [])
             new_opts      = len(q.get("options") or [])
+            
+            # Log if same question has conflicting answers
+            if existing_ans and new_ans and existing_ans != new_ans:
+                qtype = seen[qnum].get("questionType", "UNKNOWN")
+                qtext = seen[qnum].get("questionText", "")[:60]
+                print(f"  ⚠️ INCONSISTENT Q{qnum} [{qtype}]: existing='{existing_ans}' vs. new='{new_ans}'")
+                print(f"     Text: {qtext}...")
+            
+            # Prefer extraction with more options
             if new_opts > existing_opts:
                 seen[qnum] = q
             elif new_opts == existing_opts:
-                if not seen[qnum].get("Answer") and q.get("Answer"):
+                # If same options, prefer the one with a non-empty answer
+                if not existing_ans and new_ans:
                     seen[qnum] = q
     return [v for _, v in sorted(seen.items())]
 

@@ -2,7 +2,10 @@
   "scripts": {
     "validate-answers": "node Server/scripts/validate-answers.js",
     "migrate-answers": "node Server/scripts/migrate-answers.js",
-    "migrate-answers:dry-run": "node Server/scripts/migrate-answers.js --dry-run"
+    "migrate-answers:dry-run": "node Server/scripts/migrate-answers.js --dry-run",
+    "diagnose-mcq": "node Server/scripts/diagnose-mcq-issues.js",
+    "fix-mcq": "node Server/scripts/fix-mcq-answers.js",
+    "fix-mcq:apply": "node Server/scripts/fix-mcq-answers.js --apply"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
