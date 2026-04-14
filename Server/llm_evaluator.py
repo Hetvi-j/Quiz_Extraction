@@ -136,158 +136,160 @@ class EvalResult(BaseModel):
 
 def evaluate_objective(question: dict) -> dict:
     """
-    Evaluate objective questions (MCQ, TRUE_FALSE, FILL_BLANK).
-    Uses tolerant comparisons for FILL_BLANK and TRUE_FALSE (fuzzy/numeric),
-    while keeping MCQ behavior (with partial credit for multi-answer MCQs).
-    No LLM needed for these.
+    Evaluate objective questions using LLM to determine correctness without answer key.
     """
-    correct_raw = str(question.get("correctAnswer", "")).strip()
+    return evaluate_objective_with_llm(question)
+
+
+def evaluate_objective_with_llm(question: dict) -> dict:
+    """
+    Evaluate objective questions using LLM to determine correctness without answer key.
+    """
     student_raw = str(question.get("studentAnswer", "")).strip()
     marks = question.get("marks", 1)
     qtype = question.get("questionType", "MCQ").upper()
+    question_text = question.get("questionText", "")
+    options = question.get("options", [])
 
-    if qtype == "MCQ":
-        # Handle multi-answer MCQs (e.g., "A,C" vs "A,C")
-        correct_set = set(c.strip() for c in correct_raw.split(","))
-        student_set = set(s.strip() for s in student_raw.split(","))
-
-        if correct_set == student_set:
-            return {
-                "obtainedMarks": marks,
-                "isCorrect": True,
-                "isPartial": False,
-                "feedback": "Correct answer.",
-                "keyPoints": [f"Selected: {student_raw}"],
-                "missedPoints": [],
-                "confidence": 1.0
-            }
-        elif student_set & correct_set:
-            # Partial credit for multi-answer MCQs
-            overlap = len(student_set & correct_set)
-            total = len(correct_set)
-            partial_marks = round((overlap / total) * marks, 2)
-            return {
-                "obtainedMarks": partial_marks,
-                "isCorrect": False,
-                "isPartial": True,
-                "feedback": f"Partially correct. Got {overlap}/{total} correct options.",
-                "keyPoints": [f"Correct selections: {', '.join(student_set & correct_set)}"],
-                "missedPoints": [f"Missed: {', '.join(correct_set - student_set)}"],
-                "confidence": 1.0
-            }
-        else:
-            return {
-                "obtainedMarks": 0,
-                "isCorrect": False,
-                "isPartial": False,
-                "feedback": f"Incorrect. Expected: {correct_raw}, Got: {student_raw}",
-                "keyPoints": [],
-                "missedPoints": [f"Correct answer was: {correct_raw}"],
-                "confidence": 1.0
-            }
-
-    elif qtype == "TRUE_FALSE":
-        # Accept common variants: true/false, yes/no, t/f
-        corr = _normalize_text(correct_raw)
-        stud = _normalize_text(student_raw)
-        # map to canonical 'true' or 'false' if possible
-        true_set = {"true", "t", "yes", "y", "1"}
-        false_set = {"false", "f", "no", "n", "0"}
-
-        if stud in true_set or stud in false_set:
-            is_correct = (stud in true_set and corr in true_set) or (stud in false_set and corr in false_set)
-        else:
-            # fallback to fuzzy equality
-            is_correct = _similarity(corr, stud) >= 0.9
-
+    if not student_raw:
         return {
-            "obtainedMarks": marks if is_correct else 0,
-            "isCorrect": is_correct,
+            "obtainedMarks": 0,
+            "isCorrect": False,
             "isPartial": False,
-            "feedback": "Correct." if is_correct else f"Incorrect. The answer is {correct_raw}.",
-            "keyPoints": [student_raw] if is_correct else [],
-            "missedPoints": [] if is_correct else [f"Correct answer: {correct_raw}"],
+            "feedback": "No answer provided.",
+            "keyPoints": [],
+            "missedPoints": [],
             "confidence": 1.0
         }
 
-    elif qtype == "FILL_BLANK":
-        corr = _normalize_text(correct_raw)
-        stud = _normalize_text(student_raw)
-        # If both are numeric, compare numerically with tolerance
-        if _is_number(corr) and _is_number(stud):
-            numeric_match = _numeric_similarity(corr, stud)
-            if numeric_match:
-                return {
-                    "obtainedMarks": marks,
-                    "isCorrect": True,
-                    "isPartial": False,
-                    "feedback": "Numeric answer within tolerance.",
-                    "keyPoints": [student_raw],
-                    "missedPoints": [],
-                    "confidence": 1.0
-                }
-            else:
-                # give partial proportional to closeness
-                try:
-                    a = float(corr)
-                    b = float(stud)
-                    ratio = max(0.0, 1.0 - abs(a - b) / (abs(a) + 1e-9))
-                    partial_marks = round(ratio * marks, 2)
-                except Exception:
-                    partial_marks = 0
-                return {
-                    "obtainedMarks": partial_marks,
-                    "isCorrect": partial_marks >= marks,
-                    "isPartial": 0 < partial_marks < marks,
-                    "feedback": "Numeric answer partially correct." if partial_marks > 0 else f"Incorrect. Expected: {correct_raw}",
-                    "keyPoints": [student_raw] if partial_marks > 0 else [],
-                    "missedPoints": [] if partial_marks > 0 else [f"Expected: {correct_raw}"],
-                    "confidence": 1.0
-                }
-
-        # Non-numeric: use fuzzy similarity with thresholds
-        sim = _similarity(corr, stud)
-        if sim >= 0.75:
-            return {
-                "obtainedMarks": marks,
-                "isCorrect": True,
-                "isPartial": False,
-                "feedback": "Correct.",
-                "keyPoints": [student_raw],
-                "missedPoints": [],
-                "confidence": 1.0
-            }
-        elif sim >= 0.50:
-            partial_marks = round(sim * marks, 2)
-            return {
-                "obtainedMarks": partial_marks,
-                "isCorrect": False,
-                "isPartial": True,
-                "feedback": f"Partially correct (similarity {sim:.2f}).",
-                "keyPoints": [student_raw],
-                "missedPoints": [f"Expected: {correct_raw}"],
-                "confidence": 0.8
-            }
-        else:
+    if qtype == "MCQ":
+        if not options:
             return {
                 "obtainedMarks": 0,
                 "isCorrect": False,
                 "isPartial": False,
-                "feedback": f"Incorrect. Expected: {question.get('correctAnswer', '')}",
+                "feedback": "No options provided for MCQ.",
                 "keyPoints": [],
-                "missedPoints": [f"Expected: {question.get('correctAnswer', '')}"],
-                "confidence": 0.9 if sim < 0.5 else 0.6
+                "missedPoints": [],
+                "confidence": 1.0
             }
 
-    return {
-        "obtainedMarks": 0,
-        "isCorrect": False,
-        "isPartial": False,
-        "feedback": "Unknown question type.",
-        "keyPoints": [],
-        "missedPoints": [],
-        "confidence": 0.0
-    }
+        options_text = "\n".join([f"{chr(65+i)}. {opt}" for i, opt in enumerate(options)])
+        prompt = f"""You are an expert evaluator. Evaluate this multiple choice question.
+
+Question: {question_text}
+
+Options:
+{options_text}
+
+Student's answer: {student_raw}
+
+First, determine what the correct answer should be based on the question and options.
+Then, check if the student's answer matches the correct answer.
+
+Respond in JSON format:
+{{
+    "correct_answer": "A,B,C or D (or comma-separated for multiple)",
+    "is_correct": true/false,
+    "is_partial": true/false (if some answers correct),
+    "feedback": "brief explanation",
+    "confidence": 0.0-1.0
+}}"""
+
+    elif qtype == "TRUE_FALSE":
+        prompt = f"""You are an expert evaluator. Evaluate this true/false question.
+
+Question: {question_text}
+
+Student's answer: {student_raw}
+
+Determine if the statement is true or false, and if the student's answer is correct.
+
+Respond in JSON format:
+{{
+    "correct_answer": "true" or "false",
+    "is_correct": true/false,
+    "is_partial": false,
+    "feedback": "brief explanation",
+    "confidence": 0.0-1.0
+}}"""
+
+    elif qtype == "FILL_BLANK":
+        prompt = f"""You are an expert evaluator. Evaluate this fill-in-the-blank question.
+
+Question: {question_text}
+
+Student's answer: {student_raw}
+
+Determine the correct answer and check if the student's answer is correct.
+
+Respond in JSON format:
+{{
+    "correct_answer": "the correct answer",
+    "is_correct": true/false,
+    "is_partial": true/false,
+    "feedback": "brief explanation",
+    "confidence": 0.0-1.0
+}}"""
+
+    else:
+        return {
+            "obtainedMarks": 0,
+            "isCorrect": False,
+            "isPartial": False,
+            "feedback": "Unsupported question type.",
+            "keyPoints": [],
+            "missedPoints": [],
+            "confidence": 1.0
+        }
+
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 512,
+                "response_format": {"type": "json_object"}
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+        data = json.loads(content)
+
+        correct_answer = data.get("correct_answer", "")
+        is_correct = data.get("is_correct", False)
+        is_partial = data.get("is_partial", False)
+        feedback = data.get("feedback", "")
+        confidence = data.get("confidence", 0.8)
+
+        obtained_marks = marks if is_correct else (marks * 0.5 if is_partial else 0)
+
+        return {
+            "obtainedMarks": obtained_marks,
+            "isCorrect": is_correct,
+            "isPartial": is_partial,
+            "feedback": feedback,
+            "keyPoints": [student_raw] if is_correct or is_partial else [],
+            "missedPoints": [f"Correct: {correct_answer}"] if not is_correct else [],
+            "confidence": confidence
+        }
+
+    except Exception as e:
+        print(f"LLM evaluation failed: {e}")
+        return {
+            "obtainedMarks": 0,
+            "isCorrect": False,
+            "isPartial": False,
+            "feedback": "Evaluation failed due to error.",
+            "keyPoints": [],
+            "missedPoints": [],
+            "confidence": 0.0
+        }
 
 
 def evaluate_subjective_with_llm(questions: List[Dict]) -> List[Dict]:

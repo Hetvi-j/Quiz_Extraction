@@ -31,11 +31,36 @@ if (!fs.existsSync(uploadDir)) {
 
 // DB connection
 mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 30000, // Keep trying to send operations for 30 seconds
+  socketTimeoutMS: 45000, // Close sockets after 45 seconds of inactivity
+//   bufferCommands: false, // Disable mongoose buffering
+//   bufferMaxEntries: 0, // Disable mongoose buffering
+  maxPoolSize: 10, // Maintain up to 10 socket connections
 })
 .then(() => console.log("MongoDB connected"))
 .catch((err) => console.error("MongoDB error:", err));
+
+// Connection event handlers
+mongoose.connection.on('connected', () => {
+  console.log('Mongoose connected to MongoDB');
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('Mongoose connection error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('Mongoose disconnected');
+});
+
+// Handle application termination
+process.on('SIGINT', async () => {
+  await mongoose.connection.close();
+  console.log('MongoDB connection closed due to app termination');
+  process.exit(0);
+});
 
 // API routes
 app.get("/", (req, res) => res.send("Welcome to Product API"));
