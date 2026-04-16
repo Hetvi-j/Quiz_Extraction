@@ -12,7 +12,9 @@ import {
   Library,
   FolderUp,
   GraduationCap,
-  BarChart3
+  BarChart3,
+  ClipboardCheck,
+  ScanLine
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext"; // adjust path as needed
 
@@ -22,6 +24,8 @@ const navItemsLoggedIn = [
   // { to: "/question-bank", label: "Question Bank", icon: Library },
   { to: "/quiz-create", label: "Create Quiz", icon: PlusCircle },
   { to: "/quizzes", label: "Take Quiz", icon: BookOpen },
+  { to: "/evaluation-review", label: "Review", icon: ClipboardCheck },
+  { to: "/hybrid-ocr", label: "Hybrid OCR", icon: ScanLine },
   { to: "/profile", label: "Profile", icon: User },
 ];
 

@@ -1098,10 +1098,23 @@ async function updateQuestionDifficulty(subjectId, answerKey, allResults) {
     for (let i = 0; i < answerKey.length; i++) {
       const keyQuestion = answerKey[i];
       const normalizedKeyText = normalizeText(keyQuestion.questionText);
-
-      const bankQuestionIndex = questionBank.questions.findIndex(
+      let bankQuestionIndex = questionBank.questions.findIndex(
         q => normalizeText(q.questionText) === normalizedKeyText
       );
+
+      // Fallback matching for OCR/punctuation variations so Mongo difficulty still updates.
+      if (bankQuestionIndex === -1 && normalizedKeyText.length > 20) {
+        const keyTextStart = normalizedKeyText.substring(0, 50);
+        bankQuestionIndex = questionBank.questions.findIndex(
+          q => normalizeText(q.questionText).startsWith(keyTextStart)
+        );
+      }
+      if (bankQuestionIndex === -1 && normalizedKeyText.length > 20) {
+        bankQuestionIndex = questionBank.questions.findIndex(q => {
+          const bankText = normalizeText(q.questionText);
+          return bankText.includes(normalizedKeyText) || normalizedKeyText.includes(bankText);
+        });
+      }
 
       if (bankQuestionIndex === -1) continue;
 
@@ -1155,7 +1168,7 @@ async function updateQuestionDifficulty(subjectId, answerKey, allResults) {
 
     questionBank.markModified('questions');
     await questionBank.save();
-    console.log(`✅ Updated difficulty for ${questionData.length} questions (μ=${mean.toFixed(1)}%, σ=${stdDev.toFixed(1)}%)`);
+    console.log(`✅ Updated difficulty for ${questionData.length}/${answerKey.length} questions (μ=${mean.toFixed(1)}%, σ=${stdDev.toFixed(1)}%)`);
   } catch (error) {
     console.error("Error updating question difficulty:", error);
   }

@@ -5,9 +5,11 @@ import {
   extractFromFile,
   extractAnswerKey,
   extractStudentResponse,
+  saveKeyData,
+  saveResponseData,
   evaluateSubjectiveAnswers,
   evaluateSubjectivePaper
-} from "../controllers/freeOcrController.js";
+} from "../controllers/geminiOcrController.js";
 
 const router = express.Router();
 
@@ -37,50 +39,64 @@ const upload = multer({
   }
 });
 
-// ==================== FREE OCR ROUTES ====================
+// ==================== GEMINI OCR ROUTES ====================
 
 /**
- * @route   GET /api/free-ocr/health
- * @desc    Check if Free OCR service is running
+ * @route   GET /api/gemini-ocr/health
+ * @desc    Check if Gemini OCR service is running
  * @access  Public
  */
 router.get("/health", healthCheck);
 
 /**
- * @route   POST /api/free-ocr/extract
- * @desc    Extract quiz data from uploaded file (PDF or image)
+ * @route   POST /api/gemini-ocr/extract
+ * @desc    Extract quiz data from uploaded file (PDF or image) using Gemini
  * @access  Public
  * @body    file - The file to extract from
  */
 router.post("/extract", upload.single("file"), extractFromFile);
 
 /**
- * @route   POST /api/free-ocr/extract-key
- * @desc    Extract answer key from uploaded file
+ * @route   POST /api/gemini-ocr/extract-key
+ * @desc    Extract answer key from uploaded file using Gemini
  * @access  Public
  * @body    file - The answer key file
  */
 router.post("/extract-key", upload.single("file"), extractAnswerKey);
 
 /**
- * @route   POST /api/free-ocr/extract-response
- * @desc    Extract student response from uploaded file
+ * @route   POST /api/gemini-ocr/extract-response
+ * @desc    Extract student response from uploaded file using Gemini
  * @access  Public
  * @body    file - The student response file
  */
 router.post("/extract-response", upload.single("file"), extractStudentResponse);
 
 /**
- * @route   POST /api/free-ocr/evaluate-subjective
- * @desc    Evaluate subjective answers using Groq LLM
+ * @route   POST /api/gemini-ocr/paper/:paperId/save-key
+ * @desc    Save extracted answer key to paper
+ * @access  Public
+ */
+router.post("/paper/:paperId/save-key", saveKeyData);
+
+/**
+ * @route   POST /api/gemini-ocr/paper/:paperId/save-response
+ * @desc    Save extracted student response to paper
+ * @access  Public
+ */
+router.post("/paper/:paperId/save-response", saveResponseData);
+
+/**
+ * @route   POST /api/gemini-ocr/evaluate-subjective
+ * @desc    Evaluate subjective answers using Gemini LLM
  * @access  Public
  * @body    { questions: [{ questionText, answerKey, studentAnswer, maxMarks }] }
  */
 router.post("/evaluate-subjective", evaluateSubjectiveAnswers);
 
 /**
- * @route   POST /api/free-ocr/evaluate-paper/:paperId
- * @desc    Evaluate a paper with subjective questions using Groq LLM
+ * @route   POST /api/gemini-ocr/evaluate-paper/:paperId
+ * @desc    Evaluate a paper with subjective questions using Gemini LLM
  * @access  Public
  * @param   paperId - The paper ID to evaluate
  */

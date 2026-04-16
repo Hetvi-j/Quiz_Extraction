@@ -53,6 +53,7 @@ import AnalysisPieChart from './AnalysisPieChart';
 const API_BASE_URL = "http://localhost:8080/api/v1/papers";
 const QUESTION_BANK_URL = "http://localhost:8080/api/v1/question-bank";
 const FREE_OCR_URL = "http://localhost:8080/api/v1/free-ocr";
+const GEMINI_OCR_URL = "http://localhost:8080/api/v1/gemini-ocr";
 
 interface Subject {
   _id: string;
@@ -117,6 +118,16 @@ interface QuestionBankQuestion {
   frequency: number;
   sourceFiles: string[];
   addedAt: string;
+  difficulty?: 'Easy' | 'Medium' | 'Hard' | 'Not Analyzed';
+  difficultyStats?: {
+    totalAttempts?: number;
+    correctCount?: number;
+    partialCount?: number;
+    wrongCount?: number;
+    accuracy?: number;
+    avgScore?: number;
+    lastAnalyzedAt?: string | null;
+  };
 }
 
 interface QuestionBank {
@@ -147,10 +158,10 @@ const getDifficultyColorClass = (difficulty: string) => {
   }
 };
 
-// Calculate difficulty based on class mean and standard deviation
-// Easy: accuracy > mean + 0.5 * stdDev (above average performance)
-// Hard: accuracy < mean - 0.5 * stdDev (below average performance)
-// Medium: within 0.5 stdDev of mean
+// Match backend difficulty zones exactly:
+// Easy:   x >= mean
+// Medium: mean - stdDev <= x < mean
+// Hard:   x < mean - stdDev
 const calculateDifficultyByClassMean = (
   questionAccuracies: number[]
 ): { mean: number; stdDev: number; getDifficulty: (accuracy: number) => 'Easy' | 'Medium' | 'Hard' } => {
@@ -166,14 +177,11 @@ const calculateDifficultyByClassMean = (
   const avgSquaredDiff = squaredDiffs.reduce((sum, diff) => sum + diff, 0) / questionAccuracies.length;
   const stdDev = Math.sqrt(avgSquaredDiff);
 
-  // Return function to classify difficulty based on mean
+  // Return function to classify difficulty using backend zones
   const getDifficulty = (accuracy: number): 'Easy' | 'Medium' | 'Hard' => {
-    // If stdDev is very small, use a minimum threshold
-    const threshold = Math.max(stdDev * 0.5, 5); // At least 5% difference
-
-    if (accuracy > mean + threshold) return 'Easy';  // Above class average = Easy question
-    if (accuracy < mean - threshold) return 'Hard';  // Below class average = Hard question
-    return 'Medium';  // Around class average
+    if (accuracy >= mean) return 'Easy';
+    if (accuracy >= (mean - stdDev)) return 'Medium';
+    return 'Hard';
   };
 
   return { mean, stdDev, getDifficulty };
@@ -218,7 +226,7 @@ const SubjectManager = () => {
   const [keyFile, setKeyFile] = useState<File | null>(null);
   const [studentFiles, setStudentFiles] = useState<File[]>([]);
   const [uploadStatus, setUploadStatus] = useState({ type: '', text: '' });
-  const [ocrProvider, setOcrProvider] = useState<'groq' | 'landing'>('groq'); // OCR provider selection
+  const [ocrProvider, setOcrProvider] = useState<'groq' | 'landing' | 'gemini'>('groq'); // OCR provider selection
 
   // View states
   const [expandedResult, setExpandedResult] = useState<number | null>(null);
@@ -457,7 +465,7 @@ const SubjectManager = () => {
 
     try {
       setIsProcessing(true);
-      const providerName = ocrProvider === 'groq' ? 'Groq Vision (Free)' : 'Landing AI';
+      const providerName = ocrProvider === 'groq' ? 'Groq Vision (Free)' : ocrProvider === 'gemini' ? 'Google Gemini (Free)' : 'Landing AI';
       setUploadStatus({ type: 'info', text: `Extracting with ${providerName}...` });
 
       const formData = new FormData();
@@ -469,6 +477,14 @@ const SubjectManager = () => {
         // Use FREE Groq OCR service
         const extractResponse = await axios.post(
           `${FREE_OCR_URL}/extract-key`,
+          formData,
+          { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 180000 }
+        );
+        extractedData = extractResponse.data;
+      } else if (ocrProvider === 'gemini') {
+        // Use Google Gemini OCR service
+        const extractResponse = await axios.post(
+          `${GEMINI_OCR_URL}/extract-key`,
           formData,
           { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 180000 }
         );
@@ -512,9 +528,10 @@ const SubjectManager = () => {
         );
 
         if (saveResponse.data.success) {
+          const providerLabel = ocrProvider === 'groq' ? 'Groq Free' : 'Gemini Free';
           setUploadStatus({
             type: 'success',
-            text: `Answer key uploaded! ${extractedData.totalQuestions} questions, ${extractedData.totalMarks} marks (Groq Free)`
+            text: `Answer key uploaded! ${extractedData.totalQuestions} questions, ${extractedData.totalMarks} marks (${providerLabel})`
           });
           setKeyFile(null);
           if (keyFileRef.current) keyFileRef.current.value = '';
@@ -542,22 +559,40 @@ const SubjectManager = () => {
 
     try {
       setIsProcessing(true);
-      const providerName = ocrProvider === 'groq' ? 'Groq Vision (Free)' : 'Landing AI';
+      const providerName = ocrProvider === 'groq' ? 'Groq Vision (Free)' : ocrProvider === 'gemini' ? 'Google Gemini (Free)' : 'Landing AI';
       setUploadStatus({ type: 'info', text: `Processing ${studentFiles.length} responses with ${providerName}...` });
 
-      if (ocrProvider === 'groq') {
-        // Use FREE Groq OCR for each file
+      if (ocrProvider === 'groq' || ocrProvider === 'gemini') {
+        // Use FREE Groq or Gemini OCR for each file
+        const ocrUrl = ocrProvider === 'groq' ? FREE_OCR_URL : GEMINI_OCR_URL;
+        const ocrLabel = ocrProvider === 'groq' ? 'Groq' : 'Gemini';
         const results = [];
+
+        // Build question_types map from answer key (ensures student response types match)
+        const questionTypesMap: Record<string, string> = {};
+        if (selectedQuiz?.key?.questions) {
+          selectedQuiz.key.questions.forEach((q: any, idx: number) => {
+            questionTypesMap[String(idx + 1)] = q.questionType || 'MCQ';
+          });
+        }
+        const questionTypesJson = Object.keys(questionTypesMap).length > 0
+          ? JSON.stringify(questionTypesMap)
+          : '';
+
         for (let i = 0; i < studentFiles.length; i++) {
           const file = studentFiles[i];
-          setUploadStatus({ type: 'info', text: `Processing file ${i + 1}/${studentFiles.length} with Groq...` });
+          setUploadStatus({ type: 'info', text: `Processing file ${i + 1}/${studentFiles.length} with ${ocrLabel}...` });
 
           const formData = new FormData();
           formData.append('file', file);
+          // Pass question types from answer key so student response types match
+          if (questionTypesJson) {
+            formData.append('question_types', questionTypesJson);
+          }
 
           try {
             const extractResponse = await axios.post(
-              `${FREE_OCR_URL}/extract-response`,
+              `${ocrUrl}/extract-response`,
               formData,
               { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 180000 }
             );
@@ -583,7 +618,7 @@ const SubjectManager = () => {
         const successCount = results.filter(r => r.status === 'success').length;
         setUploadStatus({
           type: successCount > 0 ? 'success' : 'error',
-          text: `Processed ${successCount}/${studentFiles.length} files with Groq (Free)`
+          text: `Processed ${successCount}/${studentFiles.length} files with ${ocrLabel} (Free)`
         });
       } else {
         // Use Landing AI (existing endpoint)
@@ -661,6 +696,7 @@ const SubjectManager = () => {
           }));
 
           setActiveTab('analytics');
+          await fetchQuestionBank(selectedSubject.name);
         }
       } else {
         setUploadStatus({ type: 'info', text: 'Evaluating...' });
@@ -687,6 +723,7 @@ const SubjectManager = () => {
           }));
 
           setActiveTab('analytics');
+          await fetchQuestionBank(selectedSubject.name);
         }
       }
     } catch (error: any) {
@@ -761,7 +798,8 @@ const SubjectManager = () => {
     const questions = selectedQuiz.key.questions;
     const totalStudents = results.length;
 
-    // Step 1: Calculate accuracy for each question (including partial marks)
+    // Step 1: Calculate accuracy exactly like backend difficulty update
+    // (full-correct only; partial/wrong tracked separately for display)
     const questionData = questions.map((q: any, idx: number) => {
       let correctCount = 0;
       let partialCount = 0;
@@ -785,9 +823,9 @@ const SubjectManager = () => {
         }
       });
 
-      // Accuracy considers full correct + weighted partial
+      // Backend uses full-correct ratio for difficulty accuracy.
       const accuracy = totalStudents > 0
-        ? ((correctCount + (partialCount * 0.5)) / totalStudents) * 100
+        ? (correctCount / totalStudents) * 100
         : 0;
 
       return {
@@ -820,21 +858,9 @@ const SubjectManager = () => {
   const classMeanAccuracy = analysisResult.classMean;
   const classStdDev = analysisResult.stdDev;
 
-  // Get difficulty for a question bank question by matching with analytics data
-  const getQuestionDifficulty = (questionText: string): 'Easy' | 'Medium' | 'Hard' | 'Not Analyzed' => {
-    if (questionAnalysis.length === 0) return 'Not Analyzed';
-
-    // Normalize text for comparison
-    const normalizeText = (text: string) => text.toLowerCase().trim().replace(/\s+/g, ' ');
-    const normalizedQuestionText = normalizeText(questionText);
-
-    // Find matching question in analysis
-    const match = questionAnalysis.find(q =>
-      normalizeText(q.questionText).includes(normalizedQuestionText) ||
-      normalizedQuestionText.includes(normalizeText(q.questionText))
-    );
-
-    return match?.difficulty || 'Not Analyzed';
+  // Read difficulty directly from MongoDB-backed question bank.
+  const getQuestionDifficulty = (question: QuestionBankQuestion): 'Easy' | 'Medium' | 'Hard' | 'Not Analyzed' => {
+    return question.difficulty || 'Not Analyzed';
   };
 
   // Get difficulty counts for question bank
@@ -845,7 +871,7 @@ const SubjectManager = () => {
 
     const counts = { Easy: 0, Medium: 0, Hard: 0, 'Not Analyzed': 0 };
     questionBank.questions.forEach(q => {
-      const difficulty = getQuestionDifficulty(q.questionText);
+      const difficulty = getQuestionDifficulty(q);
       counts[difficulty]++;
     });
     return counts;
@@ -1172,8 +1198,8 @@ const SubjectManager = () => {
                           </h4>
                           <RadioGroup
                             value={ocrProvider}
-                            onValueChange={(value) => setOcrProvider(value as 'groq' | 'landing')}
-                            className="flex flex-col sm:flex-row gap-3"
+                            onValueChange={(value) => setOcrProvider(value as 'groq' | 'landing' | 'gemini')}
+                            className="flex flex-col sm:flex-row gap-3 flex-wrap"
                           >
                             <div className={`flex items-center space-x-2 p-3 rounded-lg border-2 cursor-pointer transition-all flex-1 ${
                               ocrProvider === 'groq' ? 'border-green-500 bg-green-50' : 'border-gray-200 hover:border-gray-300'
@@ -1198,6 +1224,19 @@ const SubjectManager = () => {
                                   <span className="font-semibold">Landing AI</span>
                                 </div>
                                 <p className="text-xs text-gray-500 mt-1">Premium (Paid)</p>
+                              </Label>
+                            </div>
+                            <div className={`flex items-center space-x-2 p-3 rounded-lg border-2 cursor-pointer transition-all flex-1 ${
+                              ocrProvider === 'gemini' ? 'border-purple-500 bg-purple-50' : 'border-gray-200 hover:border-gray-300'
+                            }`}>
+                              <RadioGroupItem value="gemini" id="ocr-gemini" />
+                              <Label htmlFor="ocr-gemini" className="cursor-pointer flex-1">
+                                <div className="flex items-center gap-2">
+                                  <Sparkles className="h-4 w-4 text-purple-600" />
+                                  <span className="font-semibold">Google Gemini</span>
+                                  <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full">Best Handwriting</span>
+                                </div>
+                                <p className="text-xs text-gray-500 mt-1">Free (1500/day)</p>
                               </Label>
                             </div>
                           </RadioGroup>
@@ -1457,7 +1496,7 @@ const SubjectManager = () => {
                               q.questionText.toLowerCase().includes(questionBankSearch.toLowerCase());
                             const matchesFilter = questionBankFilter === 'all' || q.questionType === questionBankFilter;
                             const matchesDifficulty = questionBankDifficultyFilter === 'all' ||
-                              getQuestionDifficulty(q.questionText) === questionBankDifficultyFilter;
+                              getQuestionDifficulty(q) === questionBankDifficultyFilter;
                             return matchesSearch && matchesFilter && matchesDifficulty;
                           }).length})
                         </CardTitle>
@@ -1476,7 +1515,7 @@ const SubjectManager = () => {
                                 q.questionText.toLowerCase().includes(questionBankSearch.toLowerCase());
                               const matchesFilter = questionBankFilter === 'all' || q.questionType === questionBankFilter;
                               const matchesDifficulty = questionBankDifficultyFilter === 'all' ||
-                                getQuestionDifficulty(q.questionText) === questionBankDifficultyFilter;
+                                getQuestionDifficulty(q) === questionBankDifficultyFilter;
                               return matchesSearch && matchesFilter && matchesDifficulty;
                             })
                             .map((question, idx) => (
@@ -1521,9 +1560,9 @@ const SubjectManager = () => {
                                     >
                                       <Trash2 className="h-4 w-4" />
                                     </Button>
-                                    {/* Difficulty Badge from Analytics */}
+                                    {/* Difficulty Badge from MongoDB */}
                                     {(() => {
-                                      const difficulty = getQuestionDifficulty(question.questionText);
+                                      const difficulty = getQuestionDifficulty(question);
                                       return (
                                         <Badge className={`text-xs ${getDifficultyColorClass(difficulty)}`}>
                                           {difficulty}

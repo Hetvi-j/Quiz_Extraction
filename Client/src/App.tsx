@@ -10,6 +10,7 @@ import QuizCreate from "./pages/QuizCreate";
 import Content from "./pages/Content"; // <-- This is the required import
 import Quizzes from "./pages/Quizzes";
 import Analytics from "./pages/Analytics";
+import EvaluationReview from "./pages/EvaluationReview";
 import Profile from "./pages/Profile";
 import NotFound from "./pages/NotFound";
 import RegisterForm from "./pages/Register";
@@ -17,6 +18,7 @@ import Login from "./pages/login";
 import QuestionBank from "./pages/QuestionBank";
 import SubjectUpload from "./pages/SubjectUpload";
 import SubjectManager from "./pages/SubjectManager";
+import HybridOcrPanel from "./pages/HybridOcrPanel";
 
 const queryClient = new QueryClient();
 
@@ -37,7 +39,9 @@ const App = () => (
             <Route path="question-bank" element={<QuestionBank />} />
             <Route path="subject-upload" element={<SubjectUpload />} />
             <Route path="subjects" element={<SubjectManager />} />
+            <Route path="hybrid-ocr" element={<HybridOcrPanel />} />
             <Route path="profile" element={<Profile />} />
+            <Route path="evaluation-review" element={<EvaluationReview />} />
             <Route path="/register" element={<RegisterForm />} />
             <Route path="/login" element={<Login />} />
 
