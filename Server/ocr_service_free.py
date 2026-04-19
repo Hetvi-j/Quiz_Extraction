@@ -460,6 +460,83 @@ def parse_question_number(question_text: str):
     return None
 
 
+def _norm_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _subjective_word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w/-]+\b", _norm_ws(text)))
+
+
+def _looks_like_inferred_subjective_text(text: str) -> bool:
+    lowered = _norm_ws(text).lower()
+    if not lowered:
+        return False
+
+    inference_markers = [
+        "the answer is",
+        "correct answer",
+        "it seems",
+        "appears to be",
+        "probably",
+        "likely",
+        "maybe",
+        "might be",
+        "cannot determine",
+        "not visible",
+        "unclear",
+        "illegible",
+        "inferred",
+        "assumed",
+    ]
+    return any(marker in lowered for marker in inference_markers)
+
+
+def _question_overlap_ratio(question_text: str, answer_text: str) -> float:
+    q_tokens = set(re.findall(r"\b[a-z0-9]+\b", _norm_ws(question_text).lower()))
+    a_tokens = set(re.findall(r"\b[a-z0-9]+\b", _norm_ws(answer_text).lower()))
+    q_tokens = {t for t in q_tokens if len(t) > 2}
+    a_tokens = {t for t in a_tokens if len(t) > 2}
+    if not q_tokens or not a_tokens:
+        return 0.0
+    return len(q_tokens & a_tokens) / max(len(a_tokens), 1)
+
+
+def sanitize_subjective_answer(answer_text: str, question_type: str, question_text: str = "", marks: float = 1.0) -> str:
+    """
+    Keep subjective extraction verbatim and conservative.
+    If the extracted text looks inferred/polished rather than copied from ink,
+    clear it so evaluation does not grade hallucinated content.
+    """
+    answer = _norm_ws(answer_text)
+    if not answer or answer == "-":
+        return answer
+
+    qtype = normalize_question_type(question_type or "SHORT")
+    word_count = _subjective_word_count(answer)
+    overlap = _question_overlap_ratio(question_text, answer)
+    marks_val = float(marks or 1.0)
+
+    if _looks_like_inferred_subjective_text(answer):
+        return ""
+
+    if qtype == "TRUE_FALSE":
+        tf_match = re.match(r'^(true|false|t|f)\b', answer, re.IGNORECASE)
+        if not tf_match:
+            return ""
+
+    if qtype == "FILL_BLANK" and word_count > 8:
+        return ""
+
+    if qtype == "SHORT" and marks_val <= 2 and word_count > 12:
+        return ""
+
+    if qtype in ("FILL_BLANK", "SHORT", "TRUE_FALSE") and overlap >= 0.85 and word_count >= 4:
+        return ""
+
+    return answer
+
+
 def _raw_question_type_string(q: dict) -> Optional[str]:
     """Non-empty type string from model JSON, if any."""
     for k in ("questionType", "question_type", "type"):
@@ -710,6 +787,20 @@ def post_process_question(q: dict, idx: int, question_types: dict = None) -> dic
     if raw_ans == "-" or (isinstance(raw_ans, str) and raw_ans.strip() == "-"):
         q["Answer"] = "-"
 
+    if q["questionType"] in ("SHORT", "LONG", "FILL_BLANK", "TRUE_FALSE") and q["Answer"] not in ("", "-"):
+        sanitized_subjective = sanitize_subjective_answer(
+            q["Answer"],
+            q["questionType"],
+            q.get("questionText", ""),
+            q.get("marks", 1.0)
+        )
+        if sanitized_subjective != q["Answer"]:
+            print(
+                f"  Q{q.get('questionNumber', idx)}: cleared/trimmed suspicious subjective extraction "
+                f"{q['Answer']!r} -> {sanitized_subjective!r}"
+            )
+            q["Answer"] = sanitized_subjective
+
     # ── DETECT HALLUCINATED PATTERNS (MCQ only) ───────────────────────
     if q["questionType"] == "MCQ" and q["Answer"]:
         ans = q["Answer"].strip().lower()
@@ -839,6 +930,7 @@ def _richness_score_for_dedup(question: dict) -> int:
     opts = question.get("options") or []
     ans = question.get("Answer", "")
     text = question.get("questionText", "")
+    qtype = normalize_question_type(question.get("questionType", "MCQ"))
     score += len(opts) * 10
     score += len(text) // 50
     if ans and ans not in ("", "-", "[unreadable]"):
@@ -857,7 +949,10 @@ def _richness_score_for_dedup(question: dict) -> int:
     # same q_no that weren't bridge-sourced).
     confidence = question.get("_confidence", "")
     if confidence == "bridge":
-        score += 100  # full cross-page visual context — ground truth for split questions
+        if qtype == "MCQ":
+            score += 100  # bridge is most reliable for split MCQ options/marks
+        else:
+            score += 2    # do not let bridge "solve" subjective/fill answers
     elif confidence == "high":
         score += 50   # 2/3 or 3/3 seeds agreed
     elif confidence == "low":
@@ -902,6 +997,23 @@ def post_process_questions(questions: list) -> list:
         if existing is None:
             by_num[qn] = q
             continue
+
+        existing_type = normalize_question_type(existing.get("questionType", "MCQ"))
+        new_type = normalize_question_type(q.get("questionType", "MCQ"))
+        existing_conf = existing.get("_confidence", "")
+        new_conf = q.get("_confidence", "")
+
+        # Bridge should not override page extraction for non-MCQ answers unless
+        # the existing page answer is missing. This prevents "solved" bridge
+        # answers like 16 dB / 0.1 mW from replacing what the student actually wrote.
+        if existing_type != "MCQ" and new_type != "MCQ":
+            if existing_conf != "bridge" and new_conf == "bridge":
+                if existing.get("Answer", "") not in ("", None):
+                    continue
+            if existing_conf == "bridge" and new_conf != "bridge":
+                if q.get("Answer", "") not in ("", None):
+                    by_num[qn] = q
+                    continue
 
         ex_score = _richness_score_for_dedup(existing)
         nw_score = _richness_score_for_dedup(q)
@@ -1133,10 +1245,17 @@ If student crossed out an answer and wrote a NEW one:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FILL_BLANK / SHORT / LONG:
   → Transcribe EXACT handwritten text (include units like "23 dB")
-  → Do NOT correct spelling or complete sentences
+  → STRICT VERBATIM MODE: copy only words that are visibly written
+  → Do NOT correct spelling, grammar, or handwriting
+  → Do NOT complete partial words or partial sentences
+  → Do NOT rewrite rough notes into polished textbook language
+  → If only 1-2 words are visible, return only those 1-2 words
+  → If a word is unclear or missing, leave it out instead of guessing
+  → If nothing readable is visible, return ""
 
 TRUE_FALSE:
-  → Return "True" or "False" + justification if written
+  → Return "True" or "False" + justification only if that text is visibly written
+  → Do NOT invent a justification from subject knowledge
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📝 STEP 5: ENROLLMENT NUMBER
@@ -1162,6 +1281,12 @@ FORBIDDEN OUTPUT PATTERNS — if your MCQ answers match any of these, STOP and r
   ❌ Any sequence that looks like known correct answers (you have NO subject knowledge)
 
 If your output matches any forbidden pattern → clear ALL MCQ answers to "" and re-scan each one individually.
+
+For SHORT / LONG / FILL_BLANK / TRUE_FALSE, ask yourself:
+  "Did I visually read every word I am returning?"
+If ANY word is guessed from context, expected knowledge, grammar completion,
+or what a student 'probably meant' → remove that word.
+If the remaining answer becomes uncertain → return "".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📋 OUTPUT FORMAT
@@ -1475,7 +1600,8 @@ def _has_suspicious_answers(questions: list) -> bool:
 
 
 def extract_with_voting(images: list, is_bridge: bool = False, is_answer_key: bool = False,
-                        question_types: dict = None, crop_instruction: str = "") -> dict:
+                        question_types: dict = None, crop_instruction: str = "",
+                        base_questions: list = None) -> dict:
     """
     Run extraction N times with different seeds, take majority answer per question.
 
@@ -1531,6 +1657,12 @@ def extract_with_voting(images: list, is_bridge: bool = False, is_answer_key: bo
                     by_qno[qno]["best_q"] = q
             by_qno[qno]["answers"].append(q.get("Answer", ""))
 
+    base_by_qno = {}
+    for q in (base_questions or []):
+        qno = coerce_positive_qno(q.get("questionNumber"))
+        if qno is not None and qno not in base_by_qno:
+            base_by_qno[qno] = q
+
     final_questions = []
     low_confidence_count = 0
 
@@ -1538,11 +1670,32 @@ def extract_with_voting(images: list, is_bridge: bool = False, is_answer_key: bo
         entry = by_qno[qno]
         answers = entry["answers"]
         best_q = dict(entry["best_q"])
+        qtype = normalize_question_type(best_q.get("questionType", "MCQ"))
+        base_q = base_by_qno.get(qno)
+        base_answer = (base_q or {}).get("Answer", "") if base_q else ""
 
         vote_counts = Counter(answers)
         most_common_ans, count = vote_counts.most_common(1)[0]
 
-        if count >= 2:
+        if qtype != "MCQ":
+            # For non-MCQ answers, voting tends to "solve" the question instead of
+            # copying the student's handwriting. Preserve the original single-pass
+            # extraction when available, and only trust unanimous voted text.
+            if base_answer not in ("", None):
+                best_q["Answer"] = base_answer
+                best_q["_confidence"] = "base"
+                confidence_label = "base single-pass preserved"
+            elif count == len(answers) and most_common_ans not in ("", None):
+                best_q["Answer"] = most_common_ans
+                best_q["_confidence"] = "high"
+                confidence_label = f"{count}/{len(VOTING_SEEDS)} agree"
+            else:
+                best_q["Answer"] = ""
+                best_q["_confidence"] = "low"
+                best_q["_vote_detail"] = answers
+                confidence_label = f"LOW - non-MCQ disagreement, blanked: {answers}"
+                low_confidence_count += 1
+        elif count >= 2:
             # Majority agreement (2 or 3 out of 3 runs)
             best_q["Answer"] = most_common_ans
             best_q["_confidence"] = "high"
@@ -1594,7 +1747,8 @@ def _do_extract(images, is_bridge=False, is_answer_key=False,
         print("\n  ⚠️  Suspicious answers detected — escalating to voting mode...")
         return extract_with_voting(
             images, is_bridge=is_bridge, is_answer_key=is_answer_key,
-            question_types=question_types, crop_instruction=crop_instruction
+            question_types=question_types, crop_instruction=crop_instruction,
+            base_questions=result.get("questions", [])
         )
 
     return result

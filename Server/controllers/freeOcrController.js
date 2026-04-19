@@ -379,20 +379,32 @@ export const extractStudentResponse = async (req, res) => {
     let extractionRetried = false;
     if (retrySignal.retry) {
       console.log(`\n⚠️  Weak MCQ extraction for ${enrollmentNumber} (${retrySignal.emptyCount} invalid/empty, ${(retrySignal.validRatio * 100).toFixed(0)}% valid). Retrying with voting...`);
+      const originalAnswersByQuestion = new Map(answers.map((answer) => [Number(answer.questionNumber), answer]));
       response = await runExtraction(true);
       extraction = response.data.extraction || {};
       docInfo = extraction.documentInfo || docInfo;
       enrollmentNumber = docInfo.enrollmentNumber || enrollmentNumber;
-      answers = (extraction.questions || []).map((q, index) => ({
-        questionNumber: q.questionNumber || q.q_no || index + 1,
-        questionText: q.questionText || q.text || "",
-        questionType: q.questionType || q.question_type || "MCQ",
-        marks: Number(q.marks) || 1,
-        options: q.options || [],
-        answer: q.questionType === "MCQ" || q.question_type === "MCQ"
-          ? sanitizeMcqAnswer(q.Answer || q.answer || q.student_ans || "")
-          : (q.Answer || q.answer || q.student_ans || "")
-      }));
+      answers = (extraction.questions || []).map((q, index) => {
+        const questionNumber = q.questionNumber || q.q_no || index + 1;
+        const questionType = q.questionType || q.question_type || "MCQ";
+        const retried = {
+          questionNumber,
+          questionText: q.questionText || q.text || "",
+          questionType,
+          marks: Number(q.marks) || 1,
+          options: q.options || [],
+          answer: questionType === "MCQ"
+            ? sanitizeMcqAnswer(q.Answer || q.answer || q.student_ans || "")
+            : (q.Answer || q.answer || q.student_ans || "")
+        };
+
+        if (String(questionType).toUpperCase() !== "MCQ") {
+          const original = originalAnswersByQuestion.get(Number(questionNumber));
+          if (original) return { ...retried, answer: original.answer };
+        }
+
+        return retried;
+      });
       extractionRetried = true;
     }
 
