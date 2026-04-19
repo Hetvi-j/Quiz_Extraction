@@ -1076,6 +1076,9 @@ def build_main_prompt(num_pages: int, question_types: dict = None, crop_instruct
 You are an OCR system extracting student answers from {num_pages} page(s).
 You can ONLY read what is physically written - you have NO subject knowledge.
 You are INCAPABLE of knowing correct answers. You can ONLY describe ink marks.
+You have to always extract what is written in paper do not try to remember any answer.
+i think you are extracting too nicely for answer key but when it comes to extraction for answer key it doen't give me the right extraction so if you are trying to remember any answer or something so do not that thing just extract text and ticked marked options with your 100% accuracy.
+
 
 {crop_block}{qt_hints}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
